@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "model-training-pipeline"
+version = "3.0.0"
+description = "XYZ MDM 3.0 - Model Training Pipeline: Automated ML lifecycle, champion/challenger deployment, drift-triggered retraining"
+requires-python = ">=3.11"
+dependencies = [
+    # Web Framework (orchestration API)
+    "fastapi==0.109.0",
+    "uvicorn[standard]==0.27.0",
+    "gunicorn==21.2.0",
+    # Pydantic v2
+    "pydantic==2.5.3",
+    "pydantic-settings==2.1.0",
+    # Database & ORM (experiment/run registry)
+    "sqlalchemy[asyncio]==2.0.25",
+    "alembic==1.13.1",
+    "asyncpg==0.29.0",
+    "psycopg2-binary==2.9.9",
+    # MLflow (experiment tracking + model registry)
+    "mlflow==2.9.2",
+    # ML Frameworks
+    "torch==2.1.2",
+    "torchvision==0.16.2",
+    "transformers==4.36.2",
+    "datasets==2.16.1",
+    "tokenizers==0.15.0",
+    "xgboost==2.0.3",
+    "scikit-learn==1.4.0",
+    # Graph Neural Network
+    "torch-geometric==2.4.0",
+    # Hyperparameter Tuning
+    "optuna==3.5.0",
+    # SHAP explainability
+    "shap==0.44.1",
+    # Feature Store Client
+    "httpx==0.26.0",
+    "tenacity==8.2.3",
+    # Data processing
+    "numpy==1.26.3",
+    "pandas==2.1.4",
+    "pyarrow==14.0.2",
+    "scipy==1.11.4",
+    # AWS S3
+    "boto3==1.34.14",
+    "botocore==1.34.14",
+    # Kafka (retraining triggers)
+    "aiokafka==0.10.0",
+    # Scheduling
+    "apscheduler==3.10.4",
+    # ONNX export (for Triton deployment)
+    "onnx==1.15.0",
+    "onnxruntime==1.16.3",
+    # Observability
+    "prometheus-client==0.19.0",
+    "opentelemetry-api==1.22.0",
+    "opentelemetry-sdk==1.22.0",
+    "opentelemetry-instrumentation-fastapi==0.43b0",
+    "structlog==24.1.0",
+    # Utilities
+    "python-multipart==0.0.6",
+    "python-dotenv==1.0.0",
+    "orjson==3.9.12",
+    "click==8.1.7",
+    "rich==13.7.0",
+    "pyyaml==6.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==7.4.4",
+    "pytest-asyncio==0.23.3",
+    "pytest-cov==4.1.0",
+    "pytest-mock==3.12.0",
+    "black==23.12.1",
+    "ruff==0.1.9",
+    "mypy==1.8.0",
+]
+
+[project.scripts]
+train = "src.cli:train"
+evaluate = "src.cli:evaluate"
+promote = "src.cli:promote"

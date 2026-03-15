@@ -1,0 +1,144 @@
+version: "3.9"
+
+services:
+  # ─── Model Training Pipeline ──────────────────────────────────────────────
+  model-training-pipeline:
+    build:
+      context: .
+      target: production
+    container_name: model-training-pipeline
+    ports:
+      - "8007:8007"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      KAFKA_BROKERS: kafka:9092
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      FEATURE_STORE_URL: http://feature-store:8006
+      S3_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+      kafka:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - mdm-network
+
+  # ─── PostgreSQL (Training run registry) ──────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: training-postgres
+    ports:
+      - "5436:5432"
+    environment:
+      POSTGRES_DB: model_training
+      POSTGRES_USER: training_user
+      POSTGRES_PASSWORD: training_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U training_user -d model_training"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mdm-network
+
+  # ─── MLflow Server ───────────────────────────────────────────────────────
+  mlflow:
+    image: python:3.11-slim
+    container_name: mlflow-server
+    ports:
+      - "5000:5000"
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      MLFLOW_S3_ENDPOINT_URL: http://localstack:4566
+    command: >
+      bash -c "pip install mlflow boto3 psycopg2-binary --quiet &&
+               mlflow server
+               --host 0.0.0.0
+               --port 5000
+               --backend-store-uri postgresql://training_user:training_pass@postgres:5432/model_training
+               --default-artifact-root s3://xyz-mdm-artifacts/mlflow
+               --serve-artifacts"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - mdm-network
+
+  # ─── Kafka ────────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: training-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - mdm-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: training-kafka
+    ports:
+      - "9097:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9097
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    depends_on:
+      - zookeeper
+    networks:
+      - mdm-network
+
+  # ─── LocalStack (S3 for artifacts) ───────────────────────────────────────
+  localstack:
+    image: localstack/localstack:3.0
+    container_name: training-localstack
+    ports:
+      - "4567:4566"
+    environment:
+      SERVICES: s3
+      DEFAULT_REGION: us-east-1
+    networks:
+      - mdm-network
+
+  localstack-init:
+    image: amazon/aws-cli:latest
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    command: >
+      s3api create-bucket
+        --bucket xyz-mdm-artifacts
+        --endpoint-url http://localstack:4566
+    depends_on:
+      - localstack
+    networks:
+      - mdm-network
+
+volumes:
+  postgres_data:
+
+networks:
+  mdm-network:
+    driver: bridge
+    name: mdm-network
+    external: false

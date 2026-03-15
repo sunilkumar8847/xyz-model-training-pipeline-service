@@ -1,0 +1,4 @@
+[console_scripts]
+evaluate = src.cli:evaluate
+promote = src.cli:promote
+train = src.cli:train
