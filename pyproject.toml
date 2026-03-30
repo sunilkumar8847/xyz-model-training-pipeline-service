@@ -8,19 +8,19 @@ version = "3.0.0"
 description = "XYZ MDM 3.0 - Model Training Pipeline: Automated ML lifecycle, champion/challenger deployment, drift-triggered retraining"
 requires-python = ">=3.11"
 dependencies = [
-    # Web Framework (orchestration API)
-    "fastapi==0.109.0",
-    "uvicorn[standard]==0.27.0",
+    # Web Framework — standardized versions
+    "fastapi==0.111.0",
+    "uvicorn[standard]==0.30.0",
     "gunicorn==21.2.0",
-    # Pydantic v2
-    "pydantic==2.5.3",
-    "pydantic-settings==2.1.0",
-    # Database & ORM (experiment/run registry)
+    # Pydantic v2 — standardized versions
+    "pydantic==2.7.0",
+    "pydantic-settings==2.3.0",
+    # Database & ORM
     "sqlalchemy[asyncio]==2.0.25",
     "alembic==1.13.1",
     "asyncpg==0.29.0",
     "psycopg2-binary==2.9.9",
-    # MLflow (experiment tracking + model registry)
+    # MLflow
     "mlflow==2.9.2",
     # ML Frameworks
     "torch==2.1.2",
@@ -47,11 +47,11 @@ dependencies = [
     # AWS S3
     "boto3==1.34.14",
     "botocore==1.34.14",
-    # Kafka (retraining triggers)
+    # Kafka
     "aiokafka==0.10.0",
     # Scheduling
     "apscheduler==3.10.4",
-    # ONNX export (for Triton deployment)
+    # ONNX export
     "onnx==1.15.0",
     "onnxruntime==1.16.3",
     # Observability
@@ -61,7 +61,7 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi==0.43b0",
     "structlog==24.1.0",
     # Utilities
-    "python-multipart==0.0.6",
+    "python-multipart==0.0.9",
     "python-dotenv==1.0.0",
     "orjson==3.9.12",
     "click==8.1.7",
@@ -75,7 +75,6 @@ dev = [
     "pytest-asyncio==0.23.3",
     "pytest-cov==4.1.0",
     "pytest-mock==3.12.0",
-    "black==23.12.1",
     "ruff==0.1.9",
     "mypy==1.8.0",
 ]
@@ -84,3 +83,19 @@ dev = [
 train = "src.cli:train"
 evaluate = "src.cli:evaluate"
 promote = "src.cli:promote"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

@@ -128,7 +128,7 @@ def create_app() -> FastAPI:
             "champion/challenger deployment, drift-triggered retraining."
         ),
         version=settings.SERVICE_VERSION,
-        docs_url="/docs",
+        docs_url="/swagger-ui.html",
         redoc_url="/redoc",
         lifespan=lifespan,
     )

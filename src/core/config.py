@@ -19,7 +19,7 @@ class Environment(str, Enum):
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", ".env.local"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -33,15 +33,15 @@ class Settings(BaseSettings):
 
     # ─── API ─────────────────────────────────────────────────────────
     API_HOST: str = "0.0.0.0"
-    API_PORT: int = 8007
+    API_PORT: int = 8110
     API_WORKERS: int = 2
 
     # ─── PostgreSQL (Training run registry) ──────────────────────────
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
-    POSTGRES_DB: str = "model_training"
-    POSTGRES_USER: str = "training_user"
-    POSTGRES_PASSWORD: str = "training_pass"
+    POSTGRES_DB: str = "xyzmdm"
+    POSTGRES_USER: str = "xyzmdm"
+    POSTGRES_PASSWORD: str = ""
     POSTGRES_POOL_SIZE: int = 10
 
     @computed_field
@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     S3_ENDPOINT_URL: Optional[str] = None  # LocalStack
 
     # ─── Feature Store ───────────────────────────────────────────────
-    FEATURE_STORE_URL: str = "http://feature-store:8006"
+    FEATURE_STORE_URL: str = "http://localhost:8115"
     FEATURE_STORE_TIMEOUT_SECONDS: int = 30
 
     # ─── Kafka (Retraining triggers) ─────────────────────────────────
@@ -146,7 +146,7 @@ class Settings(BaseSettings):
     KUBEFLOW_NAMESPACE: str = "kubeflow"
 
     # ─── Model Inference Service ─────────────────────────────────────
-    MODEL_INFERENCE_SERVICE_URL: str = "http://model-inference-service:8000"
+    MODEL_INFERENCE_SERVICE_URL: str = "http://localhost:8090"
 
 
 settings = Settings()
