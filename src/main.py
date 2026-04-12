@@ -12,11 +12,12 @@ from typing import AsyncGenerator
 
 import structlog
 import uvicorn
-from fastapi import FastAPI, Response
+from fastapi import Depends, FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from src.api.v1.endpoints.training import router as training_router
+from src.auth.jwt_middleware import verify_token
 from src.core.config import settings
 from src.repositories.training_run_repository import Base, get_engine, get_session_factory
 
@@ -121,14 +122,16 @@ async def _run_with_restart(coro_fn):
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="XYZ MDM 3.0 — Model Training Pipeline",
+        title="XYZ MDM — Model Training Pipeline",
         description=(
             "Automated ML lifecycle management: "
             "BERT + GNN + XGBoost ensemble training, MLflow registry, "
             "champion/challenger deployment, drift-triggered retraining."
         ),
-        version=settings.SERVICE_VERSION,
-        docs_url="/swagger-ui.html",
+        version="1.0.0",
+        contact={"name": "XYZ MDM Platform", "email": "engineering@xyzmdm.com"},
+        servers=[{"url": "http://localhost:8110", "description": "Integration"}],
+        docs_url="/docs",
         redoc_url="/redoc",
         lifespan=lifespan,
     )
@@ -141,7 +144,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    app.include_router(training_router, prefix="/api")
+    app.include_router(training_router, prefix="/api", dependencies=[Depends(verify_token)])
 
     @app.get("/metrics", include_in_schema=False)
     async def metrics():

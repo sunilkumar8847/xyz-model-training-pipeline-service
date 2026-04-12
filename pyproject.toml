@@ -51,6 +51,7 @@ dependencies = [
     "aiokafka==0.10.0",
     # Scheduling
     "apscheduler==3.10.4",
+    "PyJWT[crypto]==2.8.0",
     # ONNX export
     "onnx==1.15.0",
     "onnxruntime==1.16.3",
