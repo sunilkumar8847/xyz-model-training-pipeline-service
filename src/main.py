@@ -130,8 +130,8 @@ def create_app() -> FastAPI:
         ),
         version="1.0.0",
         contact={"name": "XYZ MDM Platform", "email": "engineering@xyzmdm.com"},
-        servers=[{"url": "http://localhost:8110", "description": "Integration"}],
-        docs_url="/docs",
+        servers=[{"url": "http://localhost:8036", "description": "Integration"}],
+        docs_url="/swagger-ui.html",
         redoc_url="/redoc",
         lifespan=lifespan,
     )
