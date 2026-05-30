@@ -5,12 +5,13 @@ REST API for training pipeline management.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
+from xyz_security import TenantContext, get_current_tenant, require_permission, Resource, Action
 
 from src.api.v1.schemas import (
     HealthResponse, ModelVersionResponse,
@@ -45,6 +46,7 @@ async def trigger_training(
     request: TriggerTrainingRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db_session),
+    tenant: TenantContext = Depends(require_permission(Resource.TRAINING, Action.WRITE)),
 ):
     try:
         trigger = RetrainingTrigger(request.trigger_type)
@@ -54,19 +56,20 @@ async def trigger_training(
             detail=f"Invalid trigger_type: {request.trigger_type}",
         )
 
+    reason_str = (request.reason or trigger.value)[:500]
     run = TrainingRun(
         trigger=trigger,
-        triggered_by=f"api:{request.reason or trigger.value}",
+        triggered_by=f"api:{tenant.user_id}:{reason_str}",
     )
 
-    # Persist immediately so status is queryable
+    # Enqueue the background task BEFORE committing so a task-enqueue failure
+    # prevents an orphaned run record from being created.
+    pipeline = TrainingPipeline(db_session=db)
+    background_tasks.add_task(pipeline.run, run, request.tune_weights)
+
     repo = TrainingRunRepository(db)
     await repo.upsert(run)
     await db.commit()
-
-    # Run pipeline in background
-    pipeline = TrainingPipeline(db_session=db)
-    background_tasks.add_task(pipeline.run, run, request.tune_weights)
 
     return _run_to_response(run)
 
@@ -79,6 +82,7 @@ async def trigger_training(
 async def get_training_run(
     run_id: UUID,
     db: AsyncSession = Depends(get_db_session),
+    tenant: TenantContext = Depends(require_permission(Resource.TRAINING, Action.READ)),
 ):
     repo = TrainingRunRepository(db)
     run = await repo.get(run_id)
@@ -95,6 +99,7 @@ async def get_training_run(
 async def list_training_runs(
     limit: int = Query(default=20, le=100),
     db: AsyncSession = Depends(get_db_session),
+    tenant: TenantContext = Depends(require_permission(Resource.TRAINING, Action.READ)),
 ):
     repo = TrainingRunRepository(db)
     runs = await repo.list_recent(limit=limit)
@@ -110,6 +115,7 @@ async def list_training_runs(
 async def promote_model(
     request: PromoteRequest,
     registry: MLflowModelRegistry = Depends(get_registry),
+    tenant: TenantContext = Depends(require_permission(Resource.TRAINING, Action.WRITE)),
 ):
     success = False
     if request.target_stage == "staging":
@@ -135,11 +141,15 @@ async def promote_model(
 async def rollback_model(
     request: RollbackRequest,
     registry: MLflowModelRegistry = Depends(get_registry),
+    tenant: TenantContext = Depends(require_permission(Resource.TRAINING, Action.WRITE)),
 ):
-    rolled_back_to = registry.rollback(request.reason)
+    if not request.reason or not request.reason.strip():
+        raise HTTPException(status_code=422, detail="reason is required for rollback")
+    reason = request.reason.strip()[:500]
+    rolled_back_to = registry.rollback(reason)
     return RollbackResponse(
         rolled_back_to_version=rolled_back_to,
-        reason=request.reason,
+        reason=reason,
         success=rolled_back_to is not None,
     )
 
@@ -151,6 +161,7 @@ async def rollback_model(
 )
 async def list_models(
     registry: MLflowModelRegistry = Depends(get_registry),
+    tenant: TenantContext = Depends(require_permission(Resource.TRAINING, Action.READ)),
 ):
     versions = registry.list_versions()
     return [
@@ -171,6 +182,7 @@ async def list_models(
 )
 async def get_champion(
     registry: MLflowModelRegistry = Depends(get_registry),
+    tenant: TenantContext = Depends(require_permission(Resource.TRAINING, Action.READ)),
 ):
     champion = registry.get_current_champion()
     if not champion:

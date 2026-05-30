@@ -16,8 +16,10 @@ from fastapi import Depends, FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+import os
+
 from src.api.v1.endpoints.training import router as training_router
-from src.auth.jwt_middleware import verify_token
+from xyz_security import get_current_tenant
 from src.core.config import settings
 from src.repositories.training_run_repository import Base, get_engine, get_session_factory
 
@@ -136,15 +138,18 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    _cors_origins = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"] if settings.ENVIRONMENT.value == "development" else [],
+        allow_origins=_cors_origins,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Verified-Tenant-ID",
+                       "X-Verified-User-ID", "X-Verified-Roles", "X-Verified-Platform",
+                       "X-Request-Timestamp", "X-Gateway-Signature"],
     )
 
-    app.include_router(training_router, prefix="/api", dependencies=[Depends(verify_token)])
+    app.include_router(training_router, prefix="/api", dependencies=[Depends(get_current_tenant)])
 
     @app.get("/metrics", include_in_schema=False)
     async def metrics():
