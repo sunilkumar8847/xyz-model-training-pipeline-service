@@ -39,7 +39,7 @@ class TrainingRunResponse(BaseModel):
 
 
 class PromoteRequest(BaseModel):
-    model_version: str = Field(description="MLflow model version to promote")
+    # model_version is taken from the URL path; target_stage is the only body field
     target_stage: str = Field(description="staging | canary | production")
 
 

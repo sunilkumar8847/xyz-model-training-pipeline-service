@@ -92,18 +92,39 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as e:
         logger.warning(f"Scheduler init failed (non-critical): {e}")
 
+    # 5. Start drift detection worker
+    drift_task = None
+    drift_detector = None
+    try:
+        from src.workers.drift_detector import DriftDetector
+        drift_detector = DriftDetector()
+        await drift_detector.start()
+        drift_task = asyncio.create_task(_run_with_restart(drift_detector.run))
+        logger.info(
+            f"Drift detection worker: STARTED "
+            f"(interval={settings.DRIFT_CHECK_INTERVAL_SECONDS}s, "
+            f"KL threshold={0.1}, F1 drop threshold={0.03})"
+        )
+    except Exception as e:
+        logger.warning(f"Drift detector init failed (non-critical): {e}")
+
     logger.info(f"{settings.SERVICE_NAME} startup complete. Docs: /docs")
     yield
 
     # Shutdown
     logger.info("Shutting down model-training-pipeline...")
-    for task in [kafka_task, scheduler_task]:
+    for task in [kafka_task, scheduler_task, drift_task]:
         if task:
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
+    if drift_detector:
+        try:
+            await drift_detector.stop()
+        except Exception:
+            pass
     await get_engine().dispose()
     logger.info("Shutdown complete")
 

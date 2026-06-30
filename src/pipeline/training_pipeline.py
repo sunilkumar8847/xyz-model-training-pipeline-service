@@ -37,6 +37,7 @@ from src.core.metrics import (
     TRAINING_DURATION, MODEL_F1_SCORE, RETRAINING_TRIGGERED,
     ACTIVE_TRAINING_RUNS, ROLLBACK_EVENTS,
 )
+from src.pipeline.kfp_pipeline import KubeflowPipelineRunner
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,16 @@ class TrainingPipeline:
         self._ensemble = EnsembleTrainer()
         self._evaluator = ModelEvaluator(self._ensemble)
         self._registry = MLflowModelRegistry()
-        self._kubeflow = kubeflow_client
+        # Use provided client or build from settings
+        if kubeflow_client is not None:
+            self._kubeflow = kubeflow_client
+        elif settings.KUBEFLOW_HOST:
+            self._kubeflow = KubeflowPipelineRunner(
+                host=settings.KUBEFLOW_HOST,
+                namespace=settings.KUBEFLOW_NAMESPACE,
+            )
+        else:
+            self._kubeflow = None
 
     async def run(
         self,
@@ -80,6 +90,10 @@ class TrainingPipeline:
         training_run.status = RunStatus.RUNNING
         training_run.started_at = datetime.utcnow()
         await self._save_run(training_run)
+
+        # ── KFP path: delegate to Kubeflow Pipelines cluster ─────────
+        if self._kubeflow is not None:
+            return await self._run_via_kubeflow(training_run)
 
         try:
             # ── Stage 1: Data Collection ─────────────────────────────
@@ -218,6 +232,61 @@ class TrainingPipeline:
                 pass
         finally:
             ACTIVE_TRAINING_RUNS.dec()
+
+        return training_run
+
+    async def _run_via_kubeflow(self, training_run: TrainingRun) -> TrainingRun:
+        """
+        Submit the training pipeline to KFP and poll for completion.
+        The 8 pipeline stages run as independent KFP components (containers)
+        on the cluster, with GPU nodes assigned for Transformer and GNN stages.
+        """
+        import asyncio
+
+        try:
+            kfp_run_id = self._kubeflow.submit_run(
+                run_id=training_run.run_id,
+                feature_store_url=settings.FEATURE_STORE_URL,
+                mlflow_tracking_uri=settings.MLFLOW_TRACKING_URI,
+                mlflow_experiment=settings.MLFLOW_EXPERIMENT_NAME,
+                lookback_days=settings.TRAINING_LOOKBACK_DAYS,
+                min_pairs=settings.MIN_LABELED_PAIRS,
+                min_f1_threshold=settings.MIN_F1_THRESHOLD,
+            )
+            training_run.mlflow_run_id = kfp_run_id  # store KFP run ID for traceability
+            await self._save_run(training_run)
+
+            logger.info("[%s] KFP run submitted: %s — polling for completion", training_run.run_id, kfp_run_id)
+
+            # Poll in a thread to avoid blocking the event loop
+            final_state = await asyncio.to_thread(
+                self._kubeflow.wait_for_completion,
+                kfp_run_id,
+                10800,  # 3-hour timeout
+            )
+
+            if final_state == "SUCCEEDED":
+                training_run.status = RunStatus.COMPLETED
+                training_run.completed_at = datetime.utcnow()
+                duration = (training_run.completed_at - training_run.started_at).total_seconds()
+                TRAINING_DURATION.labels(
+                    model="ensemble", version=kfp_run_id[:8]
+                ).observe(duration)
+                logger.info("[%s] KFP pipeline SUCCEEDED in %.1f min", training_run.run_id, duration / 60)
+            else:
+                training_run.status = RunStatus.FAILED
+                training_run.error_message = f"KFP run ended with state: {final_state}"
+                training_run.completed_at = datetime.utcnow()
+                logger.error("[%s] KFP pipeline FAILED (state=%s)", training_run.run_id, final_state)
+
+        except Exception as exc:
+            training_run.status = RunStatus.FAILED
+            training_run.error_message = str(exc)
+            training_run.completed_at = datetime.utcnow()
+            logger.error("[%s] KFP submission error: %s", training_run.run_id, exc, exc_info=True)
+        finally:
+            ACTIVE_TRAINING_RUNS.dec()
+            await self._save_run(training_run)
 
         return training_run
 

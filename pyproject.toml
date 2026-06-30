@@ -52,6 +52,8 @@ dependencies = [
     # Scheduling
     "apscheduler==3.10.4",
     "PyJWT[crypto]==2.8.0",
+    # Kubeflow Pipelines 2.0 (optional — only used when KUBEFLOW_HOST is set)
+    "kfp==2.7.0",
     # ONNX export
     "onnx==1.15.0",
     "onnxruntime==1.16.3",
@@ -103,6 +105,8 @@ omit = [
     "src/registry/mlflow_registry.py",
     "src/repositories/*",
     "src/workers/retraining_trigger_consumer.py",
+    "src/workers/drift_detector.py",
+    "src/pipeline/kfp_pipeline.py",
     "src/adapters/*",
     "src/api/v1/endpoints/training.py",
 ]

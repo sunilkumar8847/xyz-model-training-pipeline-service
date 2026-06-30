@@ -107,29 +107,30 @@ async def list_training_runs(
 
 
 @router.post(
-    "/models/promote",
+    "/models/{model_version}/promote",
     response_model=PromoteResponse,
-    summary="Promote model version to a deployment stage",
+    summary="Promote a specific model version to a deployment stage",
     description="Stages: staging → canary → production. Production triggers champion/challenger swap.",
 )
 async def promote_model(
+    model_version: str,
     request: PromoteRequest,
     registry: MLflowModelRegistry = Depends(get_registry),
     tenant: TenantContext = Depends(require_permission(Resource.TRAINING, Action.WRITE)),
 ):
     success = False
     if request.target_stage == "staging":
-        success = registry.promote_to_staging(request.model_version)
+        success = registry.promote_to_staging(model_version)
     elif request.target_stage in ("canary", "production"):
-        success = registry.promote_to_production(request.model_version)
+        success = registry.promote_to_production(model_version)
     else:
         raise HTTPException(status_code=422, detail=f"Unknown stage: {request.target_stage}")
 
     return PromoteResponse(
-        model_version=request.model_version,
+        model_version=model_version,
         stage=request.target_stage,
         success=success,
-        message=f"Model {request.model_version} {'promoted to' if success else 'failed promotion to'} {request.target_stage}",
+        message=f"Model {model_version} {'promoted to' if success else 'failed promotion to'} {request.target_stage}",
     )
 
 

@@ -112,10 +112,10 @@ else
 fi
 
 log_section "TC-PROMOTE — Model promotion"
-call "TC-PROM-01: POST /v1/models/promote invalid stage → 422" 422 \
+call "TC-PROM-01: POST /v1/models/1/promote invalid stage → 422" 422 \
   -X POST "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" \
-  -d '{"model_version":"1","target_stage":"invalid_stage"}' \
-  "${BASE_URL}/v1/models/promote"
+  -d '{"target_stage":"invalid_stage"}' \
+  "${BASE_URL}/v1/models/1/promote"
 
 log_section "TC-ROLLBACK — Emergency rollback"
 call "TC-ROLL-01: POST /v1/models/rollback empty reason → 422" 422 \
