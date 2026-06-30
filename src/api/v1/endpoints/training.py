@@ -216,7 +216,15 @@ async def health_check(
     except Exception:
         checks["mlflow"] = False
 
-    checks["kafka"] = True
+    # Kafka broker connectivity check
+    try:
+        from aiokafka.admin import AIOKafkaAdminClient
+        admin = AIOKafkaAdminClient(bootstrap_servers=settings.KAFKA_BROKERS_LIST)
+        await admin.start()
+        await admin.close()
+        checks["kafka"] = True
+    except Exception:
+        checks["kafka"] = False
 
     all_ok = all(checks.values())
     return HealthResponse(

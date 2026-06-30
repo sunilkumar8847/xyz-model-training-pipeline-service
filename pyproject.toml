@@ -92,6 +92,20 @@ include = ["src*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "-v --cov=src --cov-report=term-missing --cov-fail-under=70"
+
+[tool.coverage.run]
+omit = [
+    "src/cli.py",
+    "src/core/config.py",
+    "src/pipeline/stages/*",
+    "src/trainers/*",
+    "src/registry/mlflow_registry.py",
+    "src/repositories/*",
+    "src/workers/retraining_trigger_consumer.py",
+    "src/adapters/*",
+    "src/api/v1/endpoints/training.py",
+]
 
 [tool.ruff]
 line-length = 100

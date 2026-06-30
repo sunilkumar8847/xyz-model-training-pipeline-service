@@ -19,7 +19,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.errors import KafkaError
 
 from src.core.config import settings
@@ -34,9 +34,13 @@ class RetrainingTriggerConsumer:
     launches a training pipeline run for each qualifying event.
     """
 
+    DLQ_TOPIC_SUFFIX = ".dlq"
+    MAX_RETRIES = 3
+
     def __init__(self, pipeline_launcher):
         self._launcher = pipeline_launcher
         self._consumer: Optional[AIOKafkaConsumer] = None
+        self._dlq_producer: Optional[AIOKafkaProducer] = None
         self._running = False
         self._active_run: Optional[asyncio.Task] = None
 
@@ -50,6 +54,11 @@ class RetrainingTriggerConsumer:
             value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         )
         await self._consumer.start()
+        self._dlq_producer = AIOKafkaProducer(
+            bootstrap_servers=settings.KAFKA_BROKERS_LIST,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        )
+        await self._dlq_producer.start()
         self._running = True
         logger.info(f"Retraining trigger consumer started on {settings.KAFKA_RETRAINING_TOPIC}")
 
@@ -57,6 +66,8 @@ class RetrainingTriggerConsumer:
         self._running = False
         if self._consumer:
             await self._consumer.stop()
+        if self._dlq_producer:
+            await self._dlq_producer.stop()
 
     async def run(self):
         if not self._consumer:
@@ -66,6 +77,8 @@ class RetrainingTriggerConsumer:
             if not self._running:
                 break
 
+            retry_count = 0
+            last_exc = None
             try:
                 event = self._parse_event(message.value)
                 logger.info(
@@ -83,15 +96,46 @@ class RetrainingTriggerConsumer:
                         logger.warning("EMERGENCY trigger received — cancelling current run")
                         self._active_run.cancel()
 
-                # Launch training in background
-                self._active_run = asyncio.create_task(
-                    self._launcher.launch(event)
-                )
+                # Launch with retry (up to MAX_RETRIES)
+                for attempt in range(1, self.MAX_RETRIES + 1):
+                    try:
+                        self._active_run = asyncio.create_task(
+                            self._launcher.launch(event)
+                        )
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        wait = 2 ** attempt
+                        logger.warning(
+                            f"Trigger launch attempt {attempt}/{self.MAX_RETRIES} failed: {exc}. "
+                            f"Retrying in {wait}s."
+                        )
+                        await asyncio.sleep(wait)
+                else:
+                    # All retries exhausted — send to DLQ
+                    await self._send_to_dlq(message, last_exc)
 
                 await self._consumer.commit()
 
             except Exception as e:
                 logger.error(f"Error processing retraining trigger: {e}")
+                await self._send_to_dlq(message, e)
+
+    async def _send_to_dlq(self, message, exc: Exception):
+        """Route unprocessable messages to the dead-letter topic."""
+        dlq_topic = settings.KAFKA_RETRAINING_TOPIC + self.DLQ_TOPIC_SUFFIX
+        try:
+            payload = {
+                "original_value": message.value,
+                "error": str(exc),
+                "topic": message.topic,
+                "partition": message.partition,
+                "offset": message.offset,
+            }
+            await self._dlq_producer.send_and_wait(dlq_topic, payload)
+            logger.error(f"Message sent to DLQ {dlq_topic}: {exc}")
+        except Exception as dlq_exc:
+            logger.critical(f"DLQ send failed: {dlq_exc}")
 
     def _parse_event(self, data: dict) -> RetrainingTriggerEvent:
         try:
