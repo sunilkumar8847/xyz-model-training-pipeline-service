@@ -36,8 +36,8 @@ call() {
 CREATED_RUN_ID=""
 
 log_section "TC-HEALTH — Health & Readiness"
-HEALTH_BODY=$(call "TC-HEALTH-01: GET /v1/health returns 200" 200 "${BASE_URL}/v1/health")
-if echo "${HEALTH_BODY}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'status' in d and 'checks' in d" 2>/dev/null; then
+HEALTH_BODY=$(call "TC-HEALTH-01: GET /v1/health returns 200" 200 "${AUTH_HEADERS[@]}" "${BASE_URL}/v1/health")
+if echo "${HEALTH_BODY}" | python -c "import sys,json; d=json.load(sys.stdin); assert 'status' in d and 'checks' in d" 2>/dev/null; then
   log_pass "TC-HEALTH-02: health response has status and checks fields"
 else
   log_fail "TC-HEALTH-02: health response missing required fields"
@@ -52,19 +52,19 @@ call "TC-AUTH-02: GET /v1/training/runs no headers → 401" 401 \
   "${BASE_URL}/v1/training/runs"
 call "TC-AUTH-03: GET /v1/models no headers → 401" 401 \
   "${BASE_URL}/v1/models"
-call "TC-AUTH-04: POST /v1/models/promote no headers → 401" 401 \
+call "TC-AUTH-04: POST /v1/models/1/promote no headers → 401" 401 \
   -X POST -H "Content-Type: application/json" \
-  -d '{"model_version":"1","target_stage":"staging"}' \
-  "${BASE_URL}/v1/models/promote"
+  -d '{"target_stage":"staging"}' \
+  "${BASE_URL}/v1/models/1/promote"
 
 log_section "TC-TRAINING — Trigger and track training runs"
 RUN_BODY=$(call "TC-TR-01: POST /v1/training/runs MANUAL → 202" 202 \
   -X POST "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" \
   -d '{"trigger_type":"MANUAL","reason":"audit-test"}' \
   "${BASE_URL}/v1/training/runs")
-if echo "${RUN_BODY}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'run_id' in d and d['status'] in ('PENDING','RUNNING','COMPLETED','FAILED')" 2>/dev/null; then
+if echo "${RUN_BODY}" | python -c "import sys,json; d=json.load(sys.stdin); assert 'run_id' in d and d['status'] in ('PENDING','RUNNING','COMPLETED','FAILED')" 2>/dev/null; then
   log_pass "TC-TR-02: response has run_id and valid status"
-  CREATED_RUN_ID=$(echo "${RUN_BODY}" | python3 -c "import sys,json; print(json.load(sys.stdin)['run_id'])" 2>/dev/null || echo "")
+  CREATED_RUN_ID=$(echo "${RUN_BODY}" | python -c "import sys,json; print(json.load(sys.stdin)['run_id'])" 2>/dev/null || echo "")
 else
   log_fail "TC-TR-02: response missing run_id or invalid status"
 fi
@@ -77,7 +77,7 @@ call "TC-TR-03: POST /v1/training/runs invalid trigger_type → 422" 422 \
 if [ -n "${CREATED_RUN_ID}" ]; then
   GET_BODY=$(call "TC-TR-04: GET /v1/training/runs/{run_id} → 200" 200 \
     "${AUTH_HEADERS[@]}" "${BASE_URL}/v1/training/runs/${CREATED_RUN_ID}")
-  if echo "${GET_BODY}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['run_id']==\"${CREATED_RUN_ID}\"" 2>/dev/null; then
+  if echo "${GET_BODY}" | python -c "import sys,json; d=json.load(sys.stdin); assert d['run_id']==\"${CREATED_RUN_ID}\"" 2>/dev/null; then
     log_pass "TC-TR-05: GET run returns correct run_id"
   else
     log_fail "TC-TR-05: GET run returned wrong or missing run_id"
@@ -93,7 +93,7 @@ call "TC-TR-06: GET /v1/training/runs/{run_id} non-existent → 404" 404 \
 log_section "TC-RUNS-LIST — List training runs"
 RUNS_LIST=$(call "TC-LIST-01: GET /v1/training/runs → 200" 200 \
   "${AUTH_HEADERS[@]}" "${BASE_URL}/v1/training/runs")
-if echo "${RUNS_LIST}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert isinstance(d, list)" 2>/dev/null; then
+if echo "${RUNS_LIST}" | python -c "import sys,json; d=json.load(sys.stdin); assert isinstance(d, list)" 2>/dev/null; then
   log_pass "TC-LIST-02: response is a list"
 else
   log_fail "TC-LIST-02: response is not a list"
@@ -105,7 +105,7 @@ call "TC-LIST-03: GET /v1/training/runs?limit=200 exceeds max → 422" 422 \
 log_section "TC-MODELS — Model listing and champion"
 MODELS_LIST=$(call "TC-MOD-01: GET /v1/models → 200" 200 \
   "${AUTH_HEADERS[@]}" "${BASE_URL}/v1/models")
-if echo "${MODELS_LIST}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert isinstance(d, list)" 2>/dev/null; then
+if echo "${MODELS_LIST}" | python -c "import sys,json; d=json.load(sys.stdin); assert isinstance(d, list)" 2>/dev/null; then
   log_pass "TC-MOD-02: models response is a list"
 else
   log_fail "TC-MOD-02: models response is not a list"

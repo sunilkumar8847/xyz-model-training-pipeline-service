@@ -4,6 +4,7 @@ REST API for training pipeline management.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -164,7 +165,13 @@ async def list_models(
     registry: MLflowModelRegistry = Depends(get_registry),
     tenant: TenantContext = Depends(require_permission(Resource.TRAINING, Action.READ)),
 ):
-    versions = registry.list_versions()
+    loop = asyncio.get_event_loop()
+    try:
+        versions = await asyncio.wait_for(
+            loop.run_in_executor(None, registry.list_versions), timeout=6.0
+        )
+    except (asyncio.TimeoutError, Exception):
+        versions = []
     return [
         ModelVersionResponse(
             version=v["version"],
@@ -185,7 +192,13 @@ async def get_champion(
     registry: MLflowModelRegistry = Depends(get_registry),
     tenant: TenantContext = Depends(require_permission(Resource.TRAINING, Action.READ)),
 ):
-    champion = registry.get_current_champion()
+    loop = asyncio.get_event_loop()
+    try:
+        champion = await asyncio.wait_for(
+            loop.run_in_executor(None, registry.get_current_champion), timeout=6.0
+        )
+    except (asyncio.TimeoutError, Exception):
+        champion = None
     if not champion:
         raise HTTPException(status_code=404, detail="No production champion model found")
     return champion

@@ -98,14 +98,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     try:
         from src.workers.drift_detector import DriftDetector
         drift_detector = DriftDetector()
-        await drift_detector.start()
+        await asyncio.wait_for(drift_detector.start(), timeout=5.0)
         drift_task = asyncio.create_task(_run_with_restart(drift_detector.run))
         logger.info(
             f"Drift detection worker: STARTED "
             f"(interval={settings.DRIFT_CHECK_INTERVAL_SECONDS}s, "
             f"KL threshold={0.1}, F1 drop threshold={0.03})"
         )
-    except Exception as e:
+    except BaseException as e:
         logger.warning(f"Drift detector init failed (non-critical): {e}")
 
     logger.info(f"{settings.SERVICE_NAME} startup complete. Docs: /docs")

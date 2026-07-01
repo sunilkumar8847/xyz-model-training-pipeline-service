@@ -44,22 +44,48 @@ class MLflowModelRegistry:
     """
 
     def __init__(self):
-        mlflow.set_tracking_uri(settings.MLFLOW_TRACKING_URI)
+        # Force 127.0.0.1 to avoid localhost→::1 IPv6 double-timeout on Windows
+        tracking_uri = settings.MLFLOW_TRACKING_URI.replace("localhost", "127.0.0.1")
+        mlflow.set_tracking_uri(tracking_uri)
         if settings.MLFLOW_REGISTRY_URI:
-            mlflow.set_registry_uri(settings.MLFLOW_REGISTRY_URI)
+            mlflow.set_registry_uri(settings.MLFLOW_REGISTRY_URI.replace("localhost", "127.0.0.1"))
         self._client = MlflowClient()
         self._ensure_experiment()
+
+    @staticmethod
+    def _mlflow_timeout_ctx():
+        """Context manager that limits MLflow calls to 3s with no retries."""
+        import socket as _s, os as _os
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            old_timeout = _s.getdefaulttimeout()
+            old_retries = _os.environ.get("MLFLOW_HTTP_REQUEST_MAX_RETRIES")
+            _s.setdefaulttimeout(3)
+            _os.environ["MLFLOW_HTTP_REQUEST_MAX_RETRIES"] = "0"
+            try:
+                yield
+            finally:
+                _s.setdefaulttimeout(old_timeout)
+                if old_retries is None:
+                    _os.environ.pop("MLFLOW_HTTP_REQUEST_MAX_RETRIES", None)
+                else:
+                    _os.environ["MLFLOW_HTTP_REQUEST_MAX_RETRIES"] = old_retries
+
+        return _ctx()
 
     def _ensure_experiment(self):
         """Create MLflow experiment if it doesn't exist."""
         try:
-            experiment = mlflow.get_experiment_by_name(settings.MLFLOW_EXPERIMENT_NAME)
-            if experiment is None:
-                mlflow.create_experiment(
-                    settings.MLFLOW_EXPERIMENT_NAME,
-                    artifact_location=settings.MLFLOW_ARTIFACT_LOCATION,
-                )
-                logger.info(f"Created MLflow experiment: {settings.MLFLOW_EXPERIMENT_NAME}")
+            with self._mlflow_timeout_ctx():
+                experiment = mlflow.get_experiment_by_name(settings.MLFLOW_EXPERIMENT_NAME)
+                if experiment is None:
+                    mlflow.create_experiment(
+                        settings.MLFLOW_EXPERIMENT_NAME,
+                        artifact_location=settings.MLFLOW_ARTIFACT_LOCATION,
+                    )
+                    logger.info(f"Created MLflow experiment: {settings.MLFLOW_EXPERIMENT_NAME}")
         except Exception as e:
             logger.warning(f"MLflow experiment init failed: {e}")
 
@@ -213,9 +239,8 @@ class MLflowModelRegistry:
         Get the currently deployed production model version and its metrics.
         """
         try:
-            versions = self._client.get_latest_versions(
-                MODEL_NAME, stages=["Production"]
-            )
+            with self._mlflow_timeout_ctx():
+                versions = self._client.get_latest_versions(MODEL_NAME, stages=["Production"])
             if not versions:
                 return None
 
@@ -311,7 +336,8 @@ class MLflowModelRegistry:
     def list_versions(self) -> List[Dict]:
         """List all registered model versions with their metrics."""
         try:
-            versions = self._client.search_model_versions(f"name='{MODEL_NAME}'")
+            with self._mlflow_timeout_ctx():
+                versions = self._client.search_model_versions(f"name='{MODEL_NAME}'")
             return [
                 {
                     "version": v.version,
