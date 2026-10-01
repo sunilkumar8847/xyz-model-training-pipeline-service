@@ -17,12 +17,14 @@ Total: ~2.5 hours on GPU A100
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import traceback
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
+from src.adapters.feature_store_client import FeatureStoreClient
 from src.core.config import settings
 from src.domain.models import (
     ModelStatus, RetrainingTrigger, RetrainingTriggerEvent,
@@ -35,11 +37,24 @@ from src.registry.mlflow_registry import MLflowModelRegistry
 from src.trainers.ensemble_trainer import EnsembleTrainer
 from src.core.metrics import (
     TRAINING_DURATION, MODEL_F1_SCORE, RETRAINING_TRIGGERED,
-    ACTIVE_TRAINING_RUNS, ROLLBACK_EVENTS,
+    ACTIVE_TRAINING_RUNS, ROLLBACK_EVENTS, STAGE_RETRIES,
 )
+from src.core.exceptions import EvaluationGateFailedError
 from src.pipeline.kfp_pipeline import KubeflowPipelineRunner
 
 logger = logging.getLogger(__name__)
+
+# Stage retry counts from LLD PART II §2.2 (Table 5)
+STAGE_RETRY_COUNTS = {
+    "data_collection": 3,
+    "feature_extraction": 3,
+    "train_transformer": 2,
+    "train_gnn": 2,
+    "train_xgboost": 3,
+    "ensemble": 2,
+    "evaluation": 2,
+    "registration": 3,
+}
 
 
 class TrainingPipeline:
@@ -55,6 +70,8 @@ class TrainingPipeline:
         kubeflow_client=None,
     ):
         self._db = db_session
+        if feature_store_client is None:
+            feature_store_client = FeatureStoreClient.from_settings()
         self._data_stage = DataCollectionStage(db_session, feature_store_client)
         self._feature_stage = FeatureExtractionStage(feature_store_client)
         self._splitter = TrainingDataSplitter(
@@ -75,6 +92,35 @@ class TrainingPipeline:
         else:
             self._kubeflow = None
 
+    async def _run_stage_with_retry(self, stage_name: str, func, *args, **kwargs):
+        """
+        Run a pipeline stage with automatic retry on failure.
+        Retry counts are defined per stage in STAGE_RETRY_COUNTS (LLD Table 5).
+        Uses exponential backoff: 30s, 60s, 90s, ...
+        """
+        max_retries = STAGE_RETRY_COUNTS.get(stage_name, 2)
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = func(*args, **kwargs)
+                # Handle both sync and async callables
+                if asyncio.iscoroutine(result):
+                    return await result
+                return result
+            except Exception as e:
+                if attempt == max_retries:
+                    logger.error(
+                        "Stage '%s' failed after %d attempts: %s",
+                        stage_name, max_retries, e,
+                    )
+                    raise
+                wait = 30 * attempt
+                STAGE_RETRIES.labels(stage=stage_name).inc()
+                logger.warning(
+                    "Stage '%s' failed (attempt %d/%d): %s. Retrying in %ds...",
+                    stage_name, attempt, max_retries, e, wait,
+                )
+                await asyncio.sleep(wait)
+
     async def run(
         self,
         training_run: TrainingRun,
@@ -89,6 +135,9 @@ class TrainingPipeline:
 
         training_run.status = RunStatus.RUNNING
         training_run.started_at = datetime.utcnow()
+        # The feature catalog version this run requests from the Feature Store —
+        # previously left at the model's hardcoded default rather than the config.
+        training_run.feature_store_version = settings.FEATURE_CATALOG_VERSION
         await self._save_run(training_run)
 
         # ── KFP path: delegate to Kubeflow Pipelines cluster ─────────
@@ -98,7 +147,11 @@ class TrainingPipeline:
         try:
             # ── Stage 1: Data Collection ─────────────────────────────
             logger.info(f"[{training_run.run_id}] ━━━ Stage 1: Data Collection")
-            pairs = await self._data_stage.execute(training_run)
+            pairs = await self._run_stage_with_retry(
+                "data_collection",
+                self._data_stage.execute,
+                training_run,
+            )
             training_run.n_training_pairs = len(pairs)
             training_run.n_positive = sum(1 for p in pairs if p.label == 1)
             training_run.n_negative = sum(1 for p in pairs if p.label == 0)
@@ -119,7 +172,12 @@ class TrainingPipeline:
             training_run.mlflow_run_id = mlflow_run_id
             await self._save_run(training_run)
 
-            dataset = await self._feature_stage.execute(training_run, pairs)
+            dataset = await self._run_stage_with_retry(
+                "feature_extraction",
+                self._feature_stage.execute,
+                training_run,
+                pairs,
+            )
 
             # Split dataset
             train_idx, val_idx, test_idx = self._splitter.split(dataset.pairs)
@@ -129,13 +187,17 @@ class TrainingPipeline:
             training_run.features_extracted_at = datetime.utcnow()
 
             self._registry.log_data_stats(training_run)
+            self._registry.log_split_stats(self._splitter.last_stats)
 
             # ── Stage 3-5: Model Training ────────────────────────────
             logger.info(f"[{training_run.run_id}] ━━━ Stages 3-5: Training all models")
-            models = self._ensemble.train_all(
-                dataset=dataset,
-                mlflow_run_id=mlflow_run_id,
-                tune_weights=tune_weights,
+            models = await self._run_stage_with_retry(
+                "ensemble",
+                asyncio.to_thread,
+                self._ensemble.train_all,
+                dataset,
+                mlflow_run_id,
+                tune_weights,
             )
 
             training_run.transformer_f1 = models["transformer"]["f1"]

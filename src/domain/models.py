@@ -82,6 +82,9 @@ class TrainingDataset:
     train_indices: Optional[List[int]] = None
     val_indices: Optional[List[int]] = None
     test_indices: Optional[List[int]] = None
+    # Column names of feature_matrix, in order, as declared by the Feature Store's
+    # offline response (None when the source did not declare them).
+    feature_names: Optional[List[str]] = None
     created_at: datetime = field(default_factory=datetime.utcnow)
 
     @property
@@ -128,6 +131,10 @@ class TrainingRun:
     n_training_pairs: int = 0
     n_positive: int = 0
     n_negative: int = 0
+
+    # Dataset identity (LLD PART III §3.2) — a deterministic fingerprint of the
+    # exact labeled pairs used, so a run can be reproduced from its dataset_version.
+    dataset_version: Optional[str] = None
 
     # Model metrics (from evaluation)
     transformer_f1: Optional[float] = None
@@ -229,6 +236,9 @@ class ModelEvaluation:
     champion_f1: Optional[float] = None
     p_value: Optional[float] = None
     is_significantly_better: bool = False
+    # Bias check (LLD PART VI §6.2)
+    bias_passes: bool = True
+    bias_f1_per_tenant: Dict[str, float] = field(default_factory=dict)
     evaluated_at: datetime = field(default_factory=datetime.utcnow)
 
     @property
@@ -237,6 +247,8 @@ class ModelEvaluation:
         if self.f1_score < 0.91:
             return False
         if self.champion_f1 and self.f1_score < self.champion_f1 + 0.005:
+            return False
+        if not self.bias_passes:
             return False
         return True
 

@@ -20,6 +20,11 @@ from src.api.v1.schemas import (
     TrainingRunResponse, TriggerTrainingRequest,
 )
 from src.core.config import settings
+from src.core.exceptions import (
+    InvalidTrainingConfigError,
+    InfrastructureUnavailableError,
+    ResourceNotFoundError,
+)
 from src.domain.models import RetrainingTrigger, RetrainingTriggerEvent, TrainingRun
 from src.pipeline.training_pipeline import ChampionChallengerManager, TrainingPipeline
 from src.registry.mlflow_registry import MLflowModelRegistry
@@ -52,9 +57,9 @@ async def trigger_training(
     try:
         trigger = RetrainingTrigger(request.trigger_type)
     except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid trigger_type: {request.trigger_type}",
+        raise InvalidTrainingConfigError(
+            f"Invalid trigger_type: {request.trigger_type}. "
+            f"Valid values: MANUAL, SCHEDULED, DRIFT_DETECTED, EMERGENCY"
         )
 
     reason_str = (request.reason or trigger.value)[:500]
@@ -88,7 +93,7 @@ async def get_training_run(
     repo = TrainingRunRepository(db)
     run = await repo.get(run_id)
     if not run:
-        raise HTTPException(status_code=404, detail=f"Training run {run_id} not found")
+        raise ResourceNotFoundError("Training run", str(run_id))
     return _run_to_response(run)
 
 
@@ -125,7 +130,7 @@ async def promote_model(
     elif request.target_stage in ("canary", "production"):
         success = registry.promote_to_production(model_version)
     else:
-        raise HTTPException(status_code=422, detail=f"Unknown stage: {request.target_stage}")
+        raise InvalidTrainingConfigError(f"Unknown target stage: {request.target_stage}. Valid: staging, canary, production")
 
     return PromoteResponse(
         model_version=model_version,
@@ -146,7 +151,7 @@ async def rollback_model(
     tenant: TenantContext = Depends(require_permission(Resource.TRAINING, Action.WRITE)),
 ):
     if not request.reason or not request.reason.strip():
-        raise HTTPException(status_code=422, detail="reason is required for rollback")
+        raise InvalidTrainingConfigError("reason is required for rollback")
     reason = request.reason.strip()[:500]
     rolled_back_to = registry.rollback(reason)
     return RollbackResponse(
@@ -205,13 +210,39 @@ async def get_champion(
 
 
 @router.get(
+    "/health/liveness",
+    summary="Liveness probe — process is alive",
+    description="Kubernetes liveness probe. Returns 200 if the process is responsive. No dependency checks.",
+)
+async def liveness():
+    return {"status": "alive", "service": settings.SERVICE_NAME}
+
+
+@router.get(
+    "/health/readiness",
+    response_model=HealthResponse,
+    summary="Readiness probe — all dependencies reachable",
+    description="Kubernetes readiness probe. Checks PostgreSQL, MLflow, and Kafka connectivity.",
+)
+async def readiness(
+    db: AsyncSession = Depends(get_db_session),
+):
+    return await _readiness_checks(db)
+
+
+@router.get(
     "/health",
     response_model=HealthResponse,
-    summary="Service health check",
+    summary="Service health check (backward-compatible)",
 )
 async def health_check(
     db: AsyncSession = Depends(get_db_session),
 ):
+    return await _readiness_checks(db)
+
+
+async def _readiness_checks(db: AsyncSession) -> HealthResponse:
+    """Shared readiness check logic for /health and /health/readiness."""
     checks = {}
 
     # PostgreSQL

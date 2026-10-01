@@ -15,6 +15,7 @@ import logging
 import os
 import tempfile
 import time
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import mlflow
@@ -107,6 +108,7 @@ class ModelEvaluator:
             feature_importance = self._compute_shap_importance(
                 models["xgb"]["model"],
                 dataset.feature_matrix[test_idx] if dataset.feature_matrix is not None else None,
+                dataset.feature_names,
             )
         except Exception as e:
             logger.warning(f"SHAP computation failed: {e}")
@@ -125,6 +127,21 @@ class ModelEvaluator:
             f"Evaluation complete in {elapsed:.1f}s: "
             f"P={precision:.4f} R={recall:.4f} F1={f1:.4f} AUC={auc:.4f}"
         )
+
+        # Bias check — ensure model doesn't degrade on specific tenants
+        bias_passes = True
+        bias_f1_per_tenant = {}
+        tenant_ids = [dataset.pairs[i].tenant_id for i in test_idx]
+        if tenant_ids and any(tid for tid in tenant_ids):
+            bias_passes, bias_f1_per_tenant = self._check_bias(
+                y_true, y_pred, tenant_ids
+            )
+            if not bias_passes:
+                logger.warning(
+                    "Bias check FAILED: F1 variance across tenants is too high. "
+                    "Per-tenant F1: %s", bias_f1_per_tenant
+                )
+            mlflow.log_metric("bias_check_passed", 1.0 if bias_passes else 0.0)
 
         evaluation = ModelEvaluation(
             model_id=model_id,
@@ -145,6 +162,8 @@ class ModelEvaluator:
             champion_f1=champion_f1,
             p_value=p_value,
             is_significantly_better=is_significant,
+            bias_passes=bias_passes,
+            bias_f1_per_tenant=bias_f1_per_tenant,
         )
 
         return evaluation
@@ -153,6 +172,7 @@ class ModelEvaluator:
         self,
         xgb_model,
         X_test: Optional[np.ndarray],
+        feature_names: Optional[List[str]] = None,
     ) -> Dict[str, float]:
         """Compute SHAP feature importance from XGBoost model."""
         if X_test is None or len(X_test) == 0:
@@ -170,11 +190,60 @@ class ModelEvaluator:
             shap_values = shap_values[1]  # Positive class
 
         importance = np.abs(shap_values).mean(axis=0)
-        feature_names = [
-            f"feat_{i}" for i in range(len(importance))
-        ]
+        if feature_names is not None and len(feature_names) == len(importance):
+            names = list(feature_names)
+        else:
+            # Only when the feature source declared no names (e.g. unit-test data).
+            logger.warning("Feature names unavailable; SHAP importance keyed by column index")
+            names = [f"column_{i}" for i in range(len(importance))]
 
-        return dict(zip(feature_names, importance.tolist()))
+        return dict(zip(names, importance.tolist()))
+
+    def _check_bias(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        tenant_ids: List[str],
+        max_f1_variance: float = 0.10,
+        min_samples_per_tenant: int = 50,
+    ) -> Tuple[bool, Dict[str, float]]:
+        """
+        Check for bias across tenant groups (LLD PART VI §6.2).
+        Ensures the model doesn't degrade on protected attributes.
+
+        Returns (passes_bias_check, f1_per_tenant_dict).
+        Fails if the F1 variance between any two tenants exceeds max_f1_variance.
+        """
+        tenant_data = defaultdict(lambda: {"true": [], "pred": []})
+
+        for yt, yp, tid in zip(y_true, y_pred, tenant_ids):
+            if tid:  # Skip None/empty tenant IDs
+                tenant_data[tid]["true"].append(int(yt))
+                tenant_data[tid]["pred"].append(int(yp))
+
+        f1_per_tenant = {}
+        for tid, data in tenant_data.items():
+            if len(data["true"]) >= min_samples_per_tenant:
+                tenant_f1 = float(f1_score(data["true"], data["pred"], zero_division=0))
+                f1_per_tenant[tid] = round(tenant_f1, 4)
+
+        if len(f1_per_tenant) < 2:
+            # Not enough tenants with sufficient data to check bias
+            return True, f1_per_tenant
+
+        min_f1 = min(f1_per_tenant.values())
+        max_f1 = max(f1_per_tenant.values())
+        variance = max_f1 - min_f1
+
+        passes = variance < max_f1_variance
+        logger.info(
+            "Bias check: %d tenants evaluated, F1 range=[%.4f, %.4f], "
+            "variance=%.4f (threshold=%.2f) → %s",
+            len(f1_per_tenant), min_f1, max_f1, variance,
+            max_f1_variance, "PASS" if passes else "FAIL",
+        )
+        return passes, f1_per_tenant
+
 
     def export_to_onnx(
         self,

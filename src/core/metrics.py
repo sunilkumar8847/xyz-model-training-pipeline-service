@@ -16,3 +16,4 @@ RETRAINING_TRIGGERED = Counter("retraining_triggered_total", "Retraining trigger
 ROLLBACK_EVENTS = Counter("rollback_events_total", "Rollback events", ["reason"])
 LABELED_PAIRS = Counter("labeled_pairs_total", "Labeled training pairs", ["source"])
 ACTIVE_TRAINING_RUNS = Gauge("active_training_runs", "Currently running training jobs")
+STAGE_RETRIES = Counter("stage_retries_total", "Pipeline stage retry attempts", ["stage"])

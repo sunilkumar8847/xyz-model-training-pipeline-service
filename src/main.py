@@ -12,15 +12,18 @@ from typing import AsyncGenerator
 
 import structlog
 import uvicorn
-from fastapi import Depends, FastAPI, Response
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from uuid import uuid4
 
 import os
 
 from src.api.v1.endpoints.training import router as training_router
 from xyz_security import get_current_tenant
 from src.core.config import settings
+from src.core.exceptions import TrainingPipelineError
 from src.repositories.training_run_repository import Base, get_engine, get_session_factory
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -171,6 +174,20 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(training_router, prefix="/api", dependencies=[Depends(get_current_tenant)])
+
+    # ── Structured error envelope (LLD PART IX) ──────────────────────
+    @app.exception_handler(TrainingPipelineError)
+    async def training_pipeline_error_handler(request: Request, exc: TrainingPipelineError):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "correlation_id": str(uuid4()),
+                }
+            },
+        )
 
     @app.get("/metrics", include_in_schema=False)
     async def metrics():

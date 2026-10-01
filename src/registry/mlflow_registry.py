@@ -22,11 +22,36 @@ from mlflow import MlflowClient
 from mlflow.entities.model_registry import ModelVersion
 
 from src.core.config import settings
+from src.core.exceptions import InfrastructureUnavailableError
 from src.domain.models import (
     ModelEvaluation, ModelStatus, TrainedModel, TrainingRun
 )
 
 logger = logging.getLogger(__name__)
+
+
+def get_git_sha() -> str:
+    """
+    Git SHA of the training code, for reproducibility (LLD PART III §3.2).
+    Prefers GIT_SHA (set by CI/container builds, where .git is usually absent),
+    then falls back to the working tree. Returns "unknown" rather than raising —
+    a missing SHA must not fail a training run, but it is recorded as missing.
+    """
+    env_sha = os.getenv("GIT_SHA")
+    if env_sha:
+        return env_sha
+    try:
+        import subprocess
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return sha.decode().strip()
+    except Exception:
+        logger.warning("Could not determine git SHA — run provenance will be incomplete")
+        return "unknown"
 
 # The registered model name in MLflow
 MODEL_NAME = "xyz-mdm-matcher"
@@ -98,6 +123,12 @@ class MLflowModelRegistry:
             "triggered_by": run.triggered_by,
             "feature_store_version": run.feature_store_version,
             "service_version": settings.SERVICE_VERSION,
+            # Lineage: which labels, which feature definition, which code, which models.
+            "feature_catalog_version": run.feature_store_version,
+            "dataset_version": run.dataset_version or "unknown",
+            "git_sha": get_git_sha(),
+            "enabled_trainers": settings.ENABLED_TRAINERS,
+            "environment": settings.ENVIRONMENT.value,
         }
 
         mlflow_run = mlflow.start_run(
@@ -135,6 +166,12 @@ class MLflowModelRegistry:
             "n_negative": run.n_negative,
             "positive_rate": run.n_positive / max(run.n_training_pairs, 1),
         })
+
+    def log_split_stats(self, stats: Dict[str, int]) -> None:
+        """Per-split sizes and label counts, plus residual entity-record overlap, so
+        every evaluation metric can be tied to the exact split it came from."""
+        if stats:
+            mlflow.log_metrics({f"split_{k}": float(v) for k, v in stats.items()})
 
     def register_model(
         self,
@@ -185,18 +222,42 @@ class MLflowModelRegistry:
                     json.dump(evaluation.feature_importance, f, indent=2)
                 mlflow.log_artifact(fi_path, "evaluation")
 
-        # Log XGBoost model
-        mlflow.xgboost.log_model(
-            models["xgb"]["model"],
-            "xgboost_model",
-            registered_model_name=f"{MODEL_NAME}-xgb",
-        )
+        # Log each model that was ACTUALLY trained. A model that was skipped
+        # (ENABLED_TRAINERS) is recorded as not-trained rather than logged as an
+        # artifact, so the registry never implies an ensemble member exists when
+        # it does not.
+        component_uris = {}
 
-        # Log PyTorch GNN model
-        mlflow.pytorch.log_model(
-            models["gnn"]["model"],
-            "gnn_model",
-        )
+        if models["xgb"].get("model") is not None:
+            mlflow.xgboost.log_model(
+                models["xgb"]["model"],
+                "xgboost_model",
+                registered_model_name=f"{MODEL_NAME}-xgb",
+            )
+            component_uris["xgboost_model_uri"] = "runs:/{run_id}/xgboost_model"
+
+        if models["gnn"].get("model") is not None:
+            mlflow.pytorch.log_model(models["gnn"]["model"], "gnn_model")
+            component_uris["gnn_model_uri"] = "runs:/{run_id}/gnn_model"
+
+        if models["transformer"].get("model") is not None:
+            mlflow.pytorch.log_model(models["transformer"]["model"], "transformer_model")
+            component_uris["transformer_model_uri"] = "runs:/{run_id}/transformer_model"
+
+            if models["transformer"].get("tokenizer"):
+                with tempfile.TemporaryDirectory() as tok_dir:
+                    models["transformer"]["tokenizer"].save_pretrained(tok_dir)
+                    mlflow.log_artifacts(tok_dir, "transformer_tokenizer")
+                component_uris["transformer_tokenizer_uri"] = "runs:/{run_id}/transformer_tokenizer"
+
+        active_run_id = mlflow.active_run().info.run_id
+        component_uris = {k: v.format(run_id=active_run_id) for k, v in component_uris.items()}
+
+        skipped = {
+            name: models[name].get("skipped_reason")
+            for name in ("transformer", "gnn", "xgb")
+            if not models[name].get("trained", models[name].get("model") is not None)
+        }
 
         # Log ensemble config
         ensemble_config = {
@@ -206,8 +267,41 @@ class MLflowModelRegistry:
             "xgb_f1": models["xgb"]["f1"],
             "ensemble_f1": evaluation.f1_score,
             "feature_store_version": run.feature_store_version,
+            "is_partial_ensemble": models.get("is_partial_ensemble", False),
+            "enabled_trainers": settings.ENABLED_TRAINERS,
+            "skipped_models": skipped,
         }
         mlflow.log_dict(ensemble_config, "ensemble_config.json")
+
+        # Ensemble manifest — binds every component artifact, the weights and the
+        # full provenance under one ensemble_version, so a served model can be
+        # traced back to exactly how it was produced (SERVICE_CONTRACTS.md §4.2).
+        manifest = {
+            "ensemble_version": run.model_version or f"run-{run.run_id.hex[:8]}",
+            "is_partial_ensemble": models.get("is_partial_ensemble", False),
+            "enabled_trainers": sorted(settings.enabled_trainers),
+            "skipped_models": skipped,
+            "feature_catalog_version": run.feature_store_version,
+            "dataset_version": run.dataset_version,
+            "git_sha": get_git_sha(),
+            "training_run_id": str(run.run_id),
+            "mlflow_run_id": active_run_id,
+            "mlflow_model_name": MODEL_NAME,
+            **component_uris,
+            "weights": {
+                "transformer": models["weights"][0],
+                "gnn": models["weights"][1],
+                "xgboost": models["weights"][2],
+            },
+            "metrics": {
+                "precision": evaluation.precision,
+                "recall": evaluation.recall,
+                "f1": evaluation.f1_score,
+                "auc": evaluation.auc_roc,
+            },
+            "created_at": datetime.utcnow().isoformat() + "Z",
+        }
+        mlflow.log_dict(manifest, "ensemble_manifest.json")
 
         # Register in Model Registry
         run_id = mlflow.active_run().info.run_id
@@ -225,11 +319,20 @@ class MLflowModelRegistry:
                     "trigger": run.trigger.value,
                 },
             )
-            version = mv.version
+            # MLflow returns the version as an int on some backends (SQLite) and a
+            # str on others. TrainingRun.model_version is a VARCHAR column, so a raw
+            # int fails the UPDATE with an asyncpg DataError AFTER the model was
+            # already registered — losing the run record for a successful training.
+            version = str(mv.version)
             logger.info(f"Model registered as {MODEL_NAME} version {version}")
         except Exception as e:
+            # Previously this set version = "1" and carried on, reporting a model
+            # version that was never registered. A registration failure is a failure.
             logger.error(f"MLflow model registration failed: {e}")
-            version = "1"  # Fallback
+            mlflow.end_run(status="FAILED")
+            raise InfrastructureUnavailableError(
+                "MLflow Model Registry", f"{type(e).__name__}: {e}"
+            ) from e
 
         mlflow.end_run(status="FINISHED")
         return version

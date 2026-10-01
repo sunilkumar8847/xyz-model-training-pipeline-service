@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import List, Optional
-from pydantic import Field, computed_field, field_validator
+from pydantic import Field, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import secrets
 
@@ -75,7 +75,59 @@ class Settings(BaseSettings):
 
     # ─── Feature Store ───────────────────────────────────────────────
     FEATURE_STORE_URL: str = "http://localhost:8115"
-    FEATURE_STORE_TIMEOUT_SECONDS: int = 30
+    # Training is a batch job: on-the-fly computation of 100 uncached pairs can take tens of
+    # seconds on CPU (longer while the Feature Store loads its embedding model).
+    FEATURE_STORE_TIMEOUT_SECONDS: int = 120
+    FEATURE_STORE_BATCH_SIZE: int = 100          # POST /api/v1/features/batch limit
+    FEATURE_STORE_SERVICE_USER: str = "svc-model-training"
+    FEATURE_STORE_SERVICE_ROLES: str = "PLATFORM_ADMIN"
+    # "offline" = POST /features/offline, point-in-time correct (LLD requirement).
+    # "online"  = POST /features/batch, current values, computes on-the-fly for cache
+    #             misses. Explicit opt-in only — it cannot prevent label leakage.
+    FEATURE_STORE_RETRIEVAL_MODE: str = "offline"
+    # Feature catalog version; MUST match the Feature Store's FEATURE_VERSION, because
+    # training and serving are only comparable when built from the same catalog.
+    FEATURE_CATALOG_VERSION: str = "v2.0.0"
+    # Fail the run if fewer than this fraction of requested pairs come back with
+    # features. Guards against "trained on almost nothing" passing as success.
+    FEATURE_COVERAGE_MIN_RATIO: float = 0.95
+
+    # ─── Trainer selection (execution profile) ────────────────────────
+    # Which models actually get trained. Default = the full production ensemble.
+    # Set to "xgboost" for the local CPU/16GB profile, where BERT fine-tuning and a
+    # real GNN are not feasible. Disabled models are NOT faked: they are reported as
+    # not-trained, excluded from the ensemble, and the remaining weights renormalized.
+    ENABLED_TRAINERS: str = "transformer,gnn,xgboost"
+
+    @property
+    def enabled_trainers(self) -> set[str]:
+        return {t.strip().lower() for t in self.ENABLED_TRAINERS.split(",") if t.strip()}
+
+    @property
+    def is_partial_ensemble(self) -> bool:
+        return self.enabled_trainers != {"transformer", "gnn", "xgboost"}
+
+    # ─── Synthetic development data ──────────────────────────────────
+    # A directory produced by the synthetic data generator at the repository root
+    # (`python -m synthetic_data --profile dev`). When set, Stage 1 adds that dataset's
+    # TRAIN-split labeled pairs, and the online Feature Store client can send the
+    # synthetic records' fields for on-the-fly feature computation.
+    #
+    # DEVELOPMENT / TEST ONLY. Rejected when ENVIRONMENT is staging or production:
+    # production must never fall back to synthetic labels. Unset (the default) means
+    # no synthetic data is read at all.
+    SYNTHETIC_DATA_DIR: Optional[str] = None
+
+    # LEGACY. The old demo dataset (demo/data/training_pairs.json) is no longer a
+    # training source. This field exists only so a stale value is REJECTED rather than
+    # silently ignored (model_config uses extra="ignore", so removing the field would
+    # make an old .env.local quietly change behaviour).
+    DEMO_DATA_DIR: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_training_data_sources(self) -> "Settings":
+        check_training_data_sources(self)
+        return self
 
     # ─── Kafka (Retraining triggers) ─────────────────────────────────
     KAFKA_BROKERS: str = "localhost:9092"
@@ -147,6 +199,31 @@ class Settings(BaseSettings):
 
     # ─── Model Inference Service ─────────────────────────────────────
     MODEL_INFERENCE_SERVICE_URL: str = "http://localhost:8090"
+
+
+SYNTHETIC_DATA_ENVIRONMENTS = frozenset({Environment.DEVELOPMENT, Environment.TEST})
+
+
+def check_training_data_sources(s: "Settings") -> None:
+    """
+    Guard the training-data configuration. Called when settings are loaded AND again
+    where synthetic data is actually read, because settings can be mutated at runtime
+    (validators do not re-run on attribute assignment).
+    """
+    if s.DEMO_DATA_DIR:
+        raise ValueError(
+            "DEMO_DATA_DIR is no longer supported: the old demo dataset is not a "
+            "training source. For local development generate a synthetic dataset "
+            "(`python -m synthetic_data --profile dev`) and set SYNTHETIC_DATA_DIR "
+            "to its output directory. Remove DEMO_DATA_DIR from your environment."
+        )
+    if s.SYNTHETIC_DATA_DIR and s.ENVIRONMENT not in SYNTHETIC_DATA_ENVIRONMENTS:
+        raise ValueError(
+            f"SYNTHETIC_DATA_DIR is set but ENVIRONMENT={s.ENVIRONMENT.value}. "
+            f"Synthetic training data is only permitted in "
+            f"{sorted(e.value for e in SYNTHETIC_DATA_ENVIRONMENTS)}; staging and "
+            f"production must use real label sources only."
+        )
 
 
 settings = Settings()

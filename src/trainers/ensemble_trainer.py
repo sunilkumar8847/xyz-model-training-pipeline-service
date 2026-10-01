@@ -476,27 +476,81 @@ class EnsembleTrainer:
         Train all three models and combine into ensemble.
         Returns dict with all models and their validation F1 scores.
         """
-        logger.info("EnsembleTrainer: training all 3 models")
+        enabled = settings.enabled_trainers
+        logger.info(f"EnsembleTrainer: training {sorted(enabled)} (of transformer/gnn/xgboost)")
 
-        # 1. Train Transformer
-        transformer_model, transformer_f1 = self._transformer_trainer.train(
-            dataset, mlflow_run_id
-        )
+        def skipped(name: str) -> Dict:
+            """A model that was deliberately not trained. Never presented as trained."""
+            return {
+                "model": None,
+                "f1": None,
+                "trained": False,
+                "skipped_reason": (
+                    f"{name} not in ENABLED_TRAINERS ({settings.ENABLED_TRAINERS}); "
+                    f"excluded from the ensemble"
+                ),
+            }
 
-        # 2. Train GNN
-        gnn_model, gnn_f1 = self._gnn_trainer.train(dataset, mlflow_run_id)
+        # 1. Transformer
+        if "transformer" in enabled:
+            transformer_model, transformer_f1 = self._transformer_trainer.train(
+                dataset, mlflow_run_id
+            )
+            # Load the tokenizer so it can be saved alongside the model in MLflow
+            transformer_tokenizer = AutoTokenizer.from_pretrained(settings.TRANSFORMER_MODEL_NAME)
+            transformer_entry = {
+                "model": transformer_model, "f1": transformer_f1,
+                "tokenizer": transformer_tokenizer, "trained": True,
+            }
+        else:
+            transformer_model = None
+            transformer_entry = skipped("transformer")
 
-        # 3. Train XGBoost
-        xgb_model, xgb_f1 = self._xgb_trainer.train(dataset, mlflow_run_id)
+        # 2. GNN
+        if "gnn" in enabled:
+            gnn_model, gnn_f1 = self._gnn_trainer.train(dataset, mlflow_run_id)
+            gnn_entry = {"model": gnn_model, "f1": gnn_f1, "trained": True}
+        else:
+            gnn_model = None
+            gnn_entry = skipped("gnn")
 
-        # 4. Tune ensemble weights if requested
-        weights = [
+        # 3. XGBoost
+        if "xgboost" in enabled:
+            xgb_model, xgb_f1 = self._xgb_trainer.train(dataset, mlflow_run_id)
+            xgb_entry = {"model": xgb_model, "f1": xgb_f1, "trained": True}
+        else:
+            xgb_model = None
+            xgb_entry = skipped("xgboost")
+
+        if not any(e["trained"] for e in (transformer_entry, gnn_entry, xgb_entry)):
+            raise ValueError(
+                f"No trainers enabled (ENABLED_TRAINERS={settings.ENABLED_TRAINERS!r}); "
+                f"nothing to train."
+            )
+
+        # 4. Ensemble weights — configured weights, zeroed for models that were not
+        #    trained, then renormalized so the enabled models still sum to 1.0.
+        configured = [
             settings.ENSEMBLE_TRANSFORMER_WEIGHT,
             settings.ENSEMBLE_GNN_WEIGHT,
             settings.ENSEMBLE_XGB_WEIGHT,
         ]
+        trained_flags = [
+            transformer_entry["trained"], gnn_entry["trained"], xgb_entry["trained"],
+        ]
+        weights = [w if t else 0.0 for w, t in zip(configured, trained_flags)]
+        total = sum(weights)
+        weights = [w / total for w in weights]
 
-        if tune_weights and dataset.feature_matrix is not None and len(dataset.feature_matrix) > 0:
+        if settings.is_partial_ensemble:
+            logger.warning(
+                "PARTIAL ENSEMBLE: trained %s only. Effective weights %s "
+                "(production weights are %s). Metrics from this run describe the "
+                "partial ensemble, not the full production model.",
+                sorted(enabled), [round(w, 4) for w in weights], configured,
+            )
+
+        if tune_weights and not settings.is_partial_ensemble                 and dataset.feature_matrix is not None and len(dataset.feature_matrix) > 0:
             weights = self._tune_ensemble_weights(
                 dataset=dataset,
                 transformer_model=transformer_model,
@@ -504,19 +558,24 @@ class EnsembleTrainer:
                 xgb_model=xgb_model,
             )
             logger.info(f"Optuna tuned ensemble weights: {weights}")
+        elif tune_weights and settings.is_partial_ensemble:
+            logger.info("Skipping Optuna weight tuning — partial ensemble has fixed weights")
 
         if mlflow_run_id:
             mlflow.log_params({
                 "ensemble_transformer_weight": weights[0],
                 "ensemble_gnn_weight": weights[1],
                 "ensemble_xgb_weight": weights[2],
+                "enabled_trainers": settings.ENABLED_TRAINERS,
+                "is_partial_ensemble": settings.is_partial_ensemble,
             })
 
         return {
-            "transformer": {"model": transformer_model, "f1": transformer_f1},
-            "gnn": {"model": gnn_model, "f1": gnn_f1},
-            "xgb": {"model": xgb_model, "f1": xgb_f1},
+            "transformer": transformer_entry,
+            "gnn": gnn_entry,
+            "xgb": xgb_entry,
             "weights": weights,
+            "is_partial_ensemble": settings.is_partial_ensemble,
         }
 
     def predict_ensemble(
@@ -535,17 +594,20 @@ class EnsembleTrainer:
         # Get predictions from each model
         probs = np.zeros(len(idx))
 
-        # XGBoost (always available if feature matrix exists)
+        # XGBoost / GNN — tabular models over the feature matrix.
         if dataset.feature_matrix is not None and len(dataset.feature_matrix) > 0:
             X = dataset.feature_matrix[idx]
-            xgb_probs = self._xgb_trainer.predict_proba(models["xgb"]["model"], X)
-            probs += weights[2] * xgb_probs
+            if models["xgb"].get("model") is not None and weights[2] > 0:
+                xgb_probs = self._xgb_trainer.predict_proba(models["xgb"]["model"], X)
+                probs += weights[2] * xgb_probs
 
-            gnn_probs = self._gnn_trainer.predict_proba(models["gnn"]["model"], X)
-            probs += weights[1] * gnn_probs
+            if models["gnn"].get("model") is not None and weights[1] > 0:
+                gnn_probs = self._gnn_trainer.predict_proba(models["gnn"]["model"], X)
+                probs += weights[1] * gnn_probs
 
         # Transformer
-        if dataset.entity_texts_1 and dataset.entity_texts_2:
+        if (models["transformer"].get("model") is not None and weights[0] > 0
+                and dataset.entity_texts_1 and dataset.entity_texts_2):
             t1 = [dataset.entity_texts_1[i] for i in idx]
             t2 = [dataset.entity_texts_2[i] for i in idx]
             from transformers import AutoTokenizer

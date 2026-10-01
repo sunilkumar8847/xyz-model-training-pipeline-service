@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Optional
 
 import httpx
+import numpy as np
 from aiokafka import AIOKafkaProducer
 
 from src.core.config import settings
@@ -32,6 +33,10 @@ logger = logging.getLogger(__name__)
 KL_THRESHOLD = 0.1
 # F1 absolute drop from champion that triggers emergency retraining
 F1_DROP_THRESHOLD = 0.03
+# Label drift: HITL override rate threshold (LLD Table 14)
+LABEL_DRIFT_OVERRIDE_THRESHOLD = 0.15
+# Prediction drift: Jensen-Shannon divergence threshold (LLD Table 14)
+PREDICTION_DRIFT_JS_THRESHOLD = 0.05
 
 
 class DriftDetector:
@@ -118,6 +123,46 @@ class DriftDetector:
                 ),
             )
 
+        # Label drift: HITL override rate
+        override_rate = await self._check_label_drift()
+        if override_rate is not None:
+            DRIFT_SCORE.labels(drift_type="label").set(override_rate)
+
+        if override_rate is not None and override_rate > LABEL_DRIFT_OVERRIDE_THRESHOLD:
+            logger.warning(
+                "Label drift detected: override_rate=%.4f > %.4f",
+                override_rate, LABEL_DRIFT_OVERRIDE_THRESHOLD,
+            )
+            await self._emit_trigger(
+                trigger_type="DRIFT_DETECTED",
+                priority="HIGH",
+                drift_score=override_rate,
+                reason=(
+                    f"Label drift: HITL override rate {override_rate:.2%} "
+                    f"exceeds threshold {LABEL_DRIFT_OVERRIDE_THRESHOLD:.0%}"
+                ),
+            )
+
+        # Prediction drift: Jensen-Shannon divergence
+        js_divergence = await self._check_prediction_drift()
+        if js_divergence is not None:
+            DRIFT_SCORE.labels(drift_type="prediction").set(js_divergence)
+
+        if js_divergence is not None and js_divergence > PREDICTION_DRIFT_JS_THRESHOLD:
+            logger.warning(
+                "Prediction drift detected: JS=%.4f > %.4f",
+                js_divergence, PREDICTION_DRIFT_JS_THRESHOLD,
+            )
+            await self._emit_trigger(
+                trigger_type="DRIFT_DETECTED",
+                priority="HIGH",
+                drift_score=js_divergence,
+                reason=(
+                    f"Prediction drift: Jensen-Shannon divergence {js_divergence:.4f} "
+                    f"exceeds threshold {PREDICTION_DRIFT_JS_THRESHOLD}"
+                ),
+            )
+
     async def _check_feature_drift(self) -> tuple[Optional[float], list[str]]:
         """
         Query Feature Store drift endpoint.
@@ -185,6 +230,59 @@ class DriftDetector:
 
         except Exception as exc:
             logger.debug("Could not fetch F1 from inference service metrics: %s", exc)
+            return None
+
+    async def _check_label_drift(self) -> Optional[float]:
+        """
+        Query HITL service for the current override rate (LLD Table 14).
+        Label drift is detected when the HITL override rate exceeds 15%.
+        Returns the override rate (0.0 - 1.0) or None if unavailable.
+        """
+        try:
+            resp = await self._http.get(
+                f"{settings.FEATURE_STORE_URL}/v1/hitl/override-rate",
+                params={"lookback_days": 7},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("override_rate")
+        except Exception as exc:
+            logger.debug("Could not fetch HITL override rate: %s", exc)
+            return None
+
+    async def _check_prediction_drift(self) -> Optional[float]:
+        """
+        Compare current vs baseline prediction score distributions
+        using Jensen-Shannon divergence (LLD Table 14).
+        Returns the JS divergence (0.0 - 1.0) or None if unavailable.
+        """
+        try:
+            resp = await self._http.get(
+                f"{settings.MODEL_INFERENCE_SERVICE_URL}/v1/score-distribution",
+                params={"window": "24h"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            current = np.array(data.get("current_distribution", []))
+            baseline = np.array(data.get("baseline_distribution", []))
+
+            if len(current) == 0 or len(baseline) == 0 or len(current) != len(baseline):
+                return None
+
+            # Normalize to probability distributions
+            current = current / (current.sum() + 1e-10)
+            baseline = baseline / (baseline.sum() + 1e-10)
+
+            # Jensen-Shannon divergence = symmetric KL
+            m = 0.5 * (current + baseline)
+            kl_pm = np.sum(current * np.log(current / (m + 1e-10) + 1e-10))
+            kl_qm = np.sum(baseline * np.log(baseline / (m + 1e-10) + 1e-10))
+            js = float(0.5 * (kl_pm + kl_qm))
+            return max(js, 0.0)  # Clamp to non-negative
+
+        except Exception as exc:
+            logger.debug("Could not fetch prediction score distribution: %s", exc)
             return None
 
     async def _emit_trigger(
