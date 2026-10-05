@@ -135,6 +135,14 @@ class TrainingRun:
     # Dataset identity (LLD PART III §3.2) — a deterministic fingerprint of the
     # exact labeled pairs used, so a run can be reproduced from its dataset_version.
     dataset_version: Optional[str] = None
+    # Lineage of the labels behind dataset_version (not persisted to the run table;
+    # written to MLflow tags and the ensemble manifest):
+    #   label_sources        {source: n_pairs}, e.g. {"synthetic": 6606}
+    #   dataset_provenance   identity of each file-based dataset that was read
+    #   feature_as_of        the point-in-time bound the features were read at
+    label_sources: Dict = field(default_factory=dict)
+    dataset_provenance: List[Dict] = field(default_factory=list)
+    feature_as_of: Optional[datetime] = None
 
     # Model metrics (from evaluation)
     transformer_f1: Optional[float] = None

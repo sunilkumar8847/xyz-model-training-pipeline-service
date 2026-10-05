@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import random
+from collections import Counter
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from uuid import UUID
@@ -113,8 +114,12 @@ class DataCollectionStage:
 
         # 6. Synthetic development data — explicit opt-in via SYNTHETIC_DATA_DIR,
         #    development/test only (enforced in src.adapters.synthetic_data).
+        provenance: List[Dict] = []
         if settings.SYNTHETIC_DATA_DIR:
+            from src.adapters.synthetic_data import dataset_provenance
+
             synthetic = self._collect_synthetic_pairs(settings.SYNTHETIC_DATA_DIR)
+            provenance.append(dataset_provenance(settings.SYNTHETIC_DATA_DIR))
             all_pairs.extend(synthetic)
             logger.warning(
                 f"  SYNTHETIC development data: {len(synthetic)} pairs from "
@@ -130,8 +135,15 @@ class DataCollectionStage:
         # Dataset fingerprint: deterministic over the exact (pair, label) set, so two
         # runs over the same labels get the same dataset_version and a run can be
         # reproduced from it (LLD PART III §3.2).
-        run.dataset_version = self._compute_dataset_version(all_pairs)
-        logger.info(f"[Run {run.run_id}] dataset_version={run.dataset_version}")
+        run.dataset_provenance = provenance
+        run.label_sources = dict(sorted(Counter(p.source for p in all_pairs).items()))
+        run.dataset_version = self._compute_dataset_version(
+            all_pairs, [p["dataset_id"] for p in provenance])
+        logger.info(
+            f"[Run {run.run_id}] dataset_version={run.dataset_version} "
+            f"label_sources={run.label_sources} "
+            f"datasets={[p['dataset_id'] for p in provenance] or 'none'}"
+        )
 
         # Log summary
         n_pos = sum(1 for p in all_pairs if p.label == 1)
@@ -202,28 +214,42 @@ class DataCollectionStage:
         return load_synthetic_labeled_pairs(data_dir)
 
     @staticmethod
-    def _compute_dataset_version(pairs: List[LabeledPair]) -> str:
+    def _compute_dataset_version(
+        pairs: List[LabeledPair], dataset_ids: Optional[List[str]] = None,
+    ) -> str:
         """
-        Content hash of the labeled dataset. Order-independent (pairs are sorted
-        first) so the same labels always yield the same version, regardless of the
-        order the sources returned them in.
+        Fingerprint of exactly what this run trained on. Order-independent, so the same
+        labels always yield the same version regardless of source order.
+
+        Each pair contributes tenant, both entity ids, label and label source. The
+        identities of the file-based datasets that supplied labels (`dataset_ids`, a
+        hash of their CONTENT) are included too, so a corpus whose records changed
+        under the same entity ids gets a different version. Tenant and source were not
+        part of this before: the same ids in two tenants collapsed into one line.
         Format: ds-<n_pairs>-<sha256[:12]>
         """
         import hashlib
 
         fingerprint = sorted(
-            f"{min(p.entity_id_1, p.entity_id_2)}:{max(p.entity_id_1, p.entity_id_2)}:{p.label}"
+            f"{p.tenant_id}:{min(p.entity_id_1, p.entity_id_2)}:"
+            f"{max(p.entity_id_1, p.entity_id_2)}:{p.label}:{p.source}"
             for p in pairs
         )
-        digest = hashlib.sha256("\n".join(fingerprint).encode()).hexdigest()[:12]
-        return f"ds-{len(pairs)}-{digest}"
+        h = hashlib.sha256("\n".join(fingerprint).encode())
+        for dataset_id in sorted(dataset_ids or []):
+            h.update(f"\ndataset:{dataset_id}".encode())
+        return f"ds-{len(pairs)}-{h.hexdigest()[:12]}"
 
     def _deduplicate(self, pairs: List[LabeledPair]) -> List[LabeledPair]:
-        """Remove duplicate pair (same entity_id_1 + entity_id_2, regardless of order)."""
+        """
+        Remove duplicates of the same pair WITHIN A TENANT (ids in either order).
+        Entity ids are only unique inside a tenant: the key used to be the two ids
+        alone, so the same ids under a second tenant were silently dropped.
+        """
         seen = set()
         unique = []
         for pair in pairs:
-            key = tuple(sorted([pair.entity_id_1, pair.entity_id_2]))
+            key = (pair.tenant_id, *sorted([pair.entity_id_1, pair.entity_id_2]))
             if key not in seen:
                 seen.add(key)
                 unique.append(pair)

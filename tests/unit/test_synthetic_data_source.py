@@ -58,15 +58,32 @@ def _pair(e1, e2, label, split="train", label_source="synthetic"):
 def _write_synthetic_dir(path: Path, pairs, entities=None, manifest=None) -> Path:
     """A minimal dataset in the generator's on-disk schema."""
     path.mkdir(parents=True, exist_ok=True)
-    (path / "manifest.json").write_text(json.dumps(manifest if manifest is not None else {
-        "generator": "synthetic_data", "source": "synthetic", "is_production_data": False,
-    }), encoding="utf-8")
     pq.write_table(pa.Table.from_pylist(pairs), path / "pairs.parquet")
     entities = entities if entities is not None else [
         {"entity_id": "C1", "fields_json": json.dumps({"name": "Ada Lovelace"})},
     ]
     pq.write_table(pa.Table.from_pylist(entities), path / "entities.parquet")
+    # A caller-supplied manifest is written verbatim (those tests are about bad
+    # provenance). The default one is sealed with a valid identity, as the generator
+    # does: datasets without an identity are refused.
+    if manifest is None:
+        manifest = _seal(path, {
+            "generator": "synthetic_data", "source": "synthetic", "is_production_data": False,
+        })
+    (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return path
+
+
+def _seal(path: Path, manifest: dict) -> dict:
+    import hashlib
+
+    files = {n: hashlib.sha256((path / n).read_bytes()).hexdigest()
+             for n in ("entities.parquet", "pairs.parquet")}
+    identity = {"source": "synthetic", "label_source": "synthetic",
+                "note": "hand-built test dataset", "files": files}
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return {**manifest, "identity": identity, "file_sha256": files,
+            "dataset_id": "synds-" + hashlib.sha256(canonical.encode("ascii")).hexdigest()[:16]}
 
 
 @pytest.fixture

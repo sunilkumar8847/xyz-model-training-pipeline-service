@@ -24,6 +24,7 @@ from mlflow.entities.model_registry import ModelVersion
 from src.core.config import settings
 from src.core.exceptions import InfrastructureUnavailableError
 from src.domain.models import (
+    TrainingDataset,
     ModelEvaluation, ModelStatus, TrainedModel, TrainingRun
 )
 
@@ -53,6 +54,60 @@ def get_git_sha() -> str:
         logger.warning("Could not determine git SHA — run provenance will be incomplete")
         return "unknown"
 
+def get_git_dirty() -> Optional[bool]:
+    """
+    True if the training code has uncommitted changes, False if the tree is clean,
+    None if that cannot be determined. A git_sha alone is misleading when the tree is
+    dirty: the commit does not contain the code that actually produced the model.
+    """
+    env = os.getenv("GIT_DIRTY")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes")
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=Path(__file__).resolve().parents[2],
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        return bool(out.strip())
+    except Exception:
+        return None
+
+
+def configure_mlflow_environment() -> str:
+    """
+    Point MLflow at the configured registry and return its scope ("server" or
+    "local-scratch"). With the server registry, artifacts are stored in S3 and written
+    by the client, so the S3 endpoint and credentials from this service's settings are
+    exported for MLflow's S3 client (only where the process has not set them already).
+    """
+    tracking_uri = settings.MLFLOW_TRACKING_URI.replace("localhost", "127.0.0.1")
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_registry_uri(
+        (settings.MLFLOW_REGISTRY_URI or settings.MLFLOW_TRACKING_URI).replace("localhost", "127.0.0.1")
+    )
+    if settings.mlflow_registry_scope == "server":
+        if settings.S3_ENDPOINT_URL:
+            os.environ.setdefault("MLFLOW_S3_ENDPOINT_URL", settings.S3_ENDPOINT_URL)
+        if settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
+            os.environ.setdefault("AWS_ACCESS_KEY_ID", settings.AWS_ACCESS_KEY_ID)
+            os.environ.setdefault("AWS_SECRET_ACCESS_KEY", settings.AWS_SECRET_ACCESS_KEY)
+        os.environ.setdefault("AWS_DEFAULT_REGION", settings.S3_REGION)
+    return settings.mlflow_registry_scope
+
+
+def registry_uri() -> str:
+    """The registry this process talks to, as recorded in lineage."""
+    return (settings.MLFLOW_REGISTRY_URI or settings.MLFLOW_TRACKING_URI).replace("localhost", "127.0.0.1")
+
+
+def label_sources_text(label_sources: Dict) -> str:
+    """{"synthetic": 6606} -> "synthetic=6606" (safe as an MLflow tag / Triton parameter)."""
+    return ",".join(f"{k}={v}" for k, v in sorted((label_sources or {}).items())) or "none"
+
+
 # The registered model name in MLflow
 MODEL_NAME = "xyz-mdm-matcher"
 
@@ -70,10 +125,13 @@ class MLflowModelRegistry:
 
     def __init__(self):
         # Force 127.0.0.1 to avoid localhost→::1 IPv6 double-timeout on Windows
-        tracking_uri = settings.MLFLOW_TRACKING_URI.replace("localhost", "127.0.0.1")
-        mlflow.set_tracking_uri(tracking_uri)
-        if settings.MLFLOW_REGISTRY_URI:
-            mlflow.set_registry_uri(settings.MLFLOW_REGISTRY_URI.replace("localhost", "127.0.0.1"))
+        self.scope = configure_mlflow_environment()
+        if self.scope != "server":
+            logger.warning(
+                "MLflow registry is a LOCAL SCRATCH store (%s). Models registered here "
+                "cannot be published to Triton; the authoritative registry is the MLflow "
+                "server (MLFLOW_TRACKING_URI=http://...).", settings.MLFLOW_TRACKING_URI,
+            )
         self._client = MlflowClient()
         self._ensure_experiment()
 
@@ -127,8 +185,11 @@ class MLflowModelRegistry:
             "feature_catalog_version": run.feature_store_version,
             "dataset_version": run.dataset_version or "unknown",
             "git_sha": get_git_sha(),
+            "git_dirty": str(get_git_dirty()).lower(),
             "enabled_trainers": settings.ENABLED_TRAINERS,
             "environment": settings.ENVIRONMENT.value,
+            "registry_scope": settings.mlflow_registry_scope,
+            **self._dataset_tags(run),
         }
 
         mlflow_run = mlflow.start_run(
@@ -158,6 +219,32 @@ class MLflowModelRegistry:
         logger.info(f"MLflow run started: {mlflow_run.info.run_id}")
         return mlflow_run.info.run_id
 
+    @staticmethod
+    def _dataset_tags(run: TrainingRun) -> Dict[str, str]:
+        """Dataset lineage as flat tags. Only what the run actually recorded."""
+        prov = run.dataset_provenance or []
+        tags = {
+            "data_mode": settings.data_mode,
+            "label_sources": label_sources_text(run.label_sources),
+        }
+        if prov:
+            tags["dataset_id"] = ",".join(p["dataset_id"] for p in prov)
+            tags["dataset_manifest_sha256"] = ",".join(p["manifest_sha256"] for p in prov)
+            tags["dataset_generator_version"] = ",".join(str(p.get("generator_version")) for p in prov)
+            tags["dataset_seed"] = ",".join(str(p.get("seed")) for p in prov)
+        return tags
+
+    def log_lineage(self, run: TrainingRun) -> None:
+        """Lineage that is only known after feature extraction."""
+        if run.feature_as_of is not None:
+            mlflow.set_tag("feature_as_of", run.feature_as_of.isoformat())
+        if run.dataset_provenance:
+            mlflow.log_dict({"datasets": run.dataset_provenance,
+                             "label_sources": run.label_sources,
+                             "data_mode": settings.data_mode,
+                             "dataset_version": run.dataset_version},
+                            "dataset_provenance.json")
+
     def log_data_stats(self, run: TrainingRun):
         """Log training data statistics."""
         mlflow.log_metrics({
@@ -173,16 +260,40 @@ class MLflowModelRegistry:
         if stats:
             mlflow.log_metrics({f"split_{k}": float(v) for k, v in stats.items()})
 
+    def _export_serving_artifact(self, models: Dict, dataset: Optional[TrainingDataset]):
+        """Verified ONNX serving artifact for the XGBoost component (see onnx_export)."""
+        from src.registry.onnx_export import OnnxExportError, export_xgboost_to_onnx
+
+        if dataset is None or dataset.feature_matrix is None or not dataset.feature_names:
+            raise OnnxExportError(
+                "Cannot build the ONNX serving artifact: the training dataset with its "
+                "Feature Store feature names is required for the parity check."
+            )
+        rows_idx = dataset.test_indices or list(range(len(dataset.feature_matrix)))
+        component = "xgboost" if models.get("is_partial_ensemble") else "xgboost_component_of_ensemble"
+        return export_xgboost_to_onnx(
+            models["xgb"]["model"],
+            dataset.feature_names,
+            dataset.feature_matrix[rows_idx],
+            component=component,
+        )
+
     def register_model(
         self,
         models: Dict,
         evaluation: ModelEvaluation,
         run: TrainingRun,
+        dataset: Optional[TrainingDataset] = None,
     ) -> Optional[str]:
         """
         Register the trained ensemble model in MLflow Model Registry.
         Only registers if F1 exceeds minimum threshold.
         Returns model version string or None if rejected.
+
+        When XGBoost was trained, its verified ONNX serving artifact is logged to the
+        same run BEFORE registration, so a registered version always carries the exact
+        artifact Triton will serve. `dataset` supplies the real rows (and the Feature
+        Store's ordered feature names) used for the ONNX parity check.
         """
         if evaluation.f1_score < settings.MIN_F1_THRESHOLD:
             logger.warning(
@@ -227,14 +338,33 @@ class MLflowModelRegistry:
         # artifact, so the registry never implies an ensemble member exists when
         # it does not.
         component_uris = {}
+        serving: Dict = {}
 
         if models["xgb"].get("model") is not None:
+            # Logged as a run artifact only. It used to be registered a second time
+            # under "<MODEL_NAME>-xgb", giving every run two registry entries whose
+            # version numbers could drift apart.
             mlflow.xgboost.log_model(
                 models["xgb"]["model"],
                 "xgboost_model",
-                registered_model_name=f"{MODEL_NAME}-xgb",
             )
             component_uris["xgboost_model_uri"] = "runs:/{run_id}/xgboost_model"
+
+            onnx_export = self._export_serving_artifact(models, dataset)
+            with tempfile.TemporaryDirectory() as onnx_dir:
+                onnx_path = os.path.join(onnx_dir, "model.onnx")
+                with open(onnx_path, "wb") as f:
+                    f.write(onnx_export.onnx_bytes)
+                sig_path = os.path.join(onnx_dir, "serving_signature.json")
+                with open(sig_path, "w") as f:
+                    json.dump(onnx_export.signature, f, indent=2)
+                mlflow.log_artifacts(onnx_dir, "onnx_model")
+            component_uris["onnx_model_uri"] = "runs:/{run_id}/onnx_model/model.onnx"
+            serving = {
+                "onnx_sha256": onnx_export.sha256,
+                "feature_names_sha256": onnx_export.signature["feature_names_sha256"],
+                "serving_component": onnx_export.signature["component"],
+            }
 
         if models["gnn"].get("model") is not None:
             mlflow.pytorch.log_model(models["gnn"]["model"], "gnn_model")
@@ -283,7 +413,18 @@ class MLflowModelRegistry:
             "skipped_models": skipped,
             "feature_catalog_version": run.feature_store_version,
             "dataset_version": run.dataset_version,
+            "dataset": {
+                "dataset_version": run.dataset_version,
+                "data_mode": settings.data_mode,
+                "label_sources": dict(run.label_sources or {}),
+                "datasets": list(run.dataset_provenance or []),
+            },
+            "feature_as_of": run.feature_as_of.isoformat() if run.feature_as_of else None,
             "git_sha": get_git_sha(),
+            "git_dirty": get_git_dirty(),
+            "environment": settings.ENVIRONMENT.value,
+            "registry_scope": settings.mlflow_registry_scope,
+            "registry_uri": registry_uri(),
             "training_run_id": str(run.run_id),
             "mlflow_run_id": active_run_id,
             "mlflow_model_name": MODEL_NAME,
@@ -300,8 +441,20 @@ class MLflowModelRegistry:
                 "auc": evaluation.auc_roc,
             },
             "created_at": datetime.utcnow().isoformat() + "Z",
+            **serving,
         }
         mlflow.log_dict(manifest, "ensemble_manifest.json")
+
+        # A model must be reproducible from a commit. Outside development a dirty
+        # working tree is refused; in development it is recorded (git_dirty) so the
+        # lineage never claims a commit that does not contain the code that ran.
+        if get_git_dirty() and settings.ENVIRONMENT.value in ("staging", "production"):
+            mlflow.end_run(status="FAILED")
+            raise InfrastructureUnavailableError(
+                "MLflow Model Registry",
+                "refusing to register a model built from a working tree with uncommitted "
+                "changes; commit the code first",
+            )
 
         # Register in Model Registry
         run_id = mlflow.active_run().info.run_id
@@ -317,6 +470,13 @@ class MLflowModelRegistry:
                     "recall": str(evaluation.recall),
                     "training_run_id": str(run.run_id),
                     "trigger": run.trigger.value,
+                    "dataset_version": str(run.dataset_version),
+                    "feature_catalog_version": str(run.feature_store_version),
+                    "git_sha": get_git_sha(),
+                    "git_dirty": str(get_git_dirty()).lower(),
+                    "registry_scope": settings.mlflow_registry_scope,
+                    **({"onnx_sha256": serving["onnx_sha256"]} if serving else {}),
+                    **self._dataset_tags(run),
                 },
             )
             # MLflow returns the version as an int on some backends (SQLite) and a
@@ -324,6 +484,11 @@ class MLflowModelRegistry:
             # int fails the UPDATE with an asyncpg DataError AFTER the model was
             # already registered — losing the run record for a successful training.
             version = str(mv.version)
+            # The manifest was written before the registry assigned a version, so it
+            # carried the run id as ensemble_version. Re-log it with the real identity.
+            manifest["ensemble_version"] = f"v{version}"
+            manifest["registered_model_version"] = version
+            mlflow.log_dict(manifest, "ensemble_manifest.json")
             logger.info(f"Model registered as {MODEL_NAME} version {version}")
         except Exception as e:
             # Previously this set version = "1" and carried on, reporting a model

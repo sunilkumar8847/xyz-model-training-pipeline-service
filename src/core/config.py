@@ -118,6 +118,42 @@ class Settings(BaseSettings):
     # no synthetic data is read at all.
     SYNTHETIC_DATA_DIR: Optional[str] = None
 
+    # ─── Bootstrap mode ──────────────────────────────────────────────
+    # The company-owned synthetic SEED corpus may be used for training outside
+    # development/test ONLY when BOTH are set:
+    #   BOOTSTRAP_MODE=true
+    #   BOOTSTRAP_DATASET_MANIFEST_SHA256=<sha256 of the corpus's manifest.json>[,...]
+    # The manifest hash pins the exact files, so an arbitrary synthetic directory is
+    # still refused in staging/production. Every other guard stays in force — in
+    # particular MIN_LABELED_PAIRS is still enforced there.
+    BOOTSTRAP_MODE: bool = False
+    BOOTSTRAP_DATASET_MANIFEST_SHA256: str = ""
+
+    @property
+    def bootstrap_manifest_allowlist(self) -> frozenset:
+        return frozenset(
+            h.strip().lower() for h in self.BOOTSTRAP_DATASET_MANIFEST_SHA256.split(",") if h.strip()
+        )
+
+    @property
+    def data_mode(self) -> str:
+        """How this run's labels are sourced; recorded in every model's lineage.
+          customer     real label sources only (no synthetic directory configured)
+          bootstrap    the pinned seed corpus, explicitly enabled (BOOTSTRAP_MODE)
+          development  an unpinned synthetic dataset, development/test only
+        """
+        if not self.SYNTHETIC_DATA_DIR:
+            return "customer"
+        return "bootstrap" if self.BOOTSTRAP_MODE else "development"
+
+    @property
+    def mlflow_registry_scope(self) -> str:
+        """"server" for an http(s) MLflow server — the ONE authoritative registry —
+        or "local-scratch" for a file/sqlite store on this machine. Models in a scratch
+        registry are for local experiments: they cannot be published to Triton."""
+        uri = (self.MLFLOW_REGISTRY_URI or self.MLFLOW_TRACKING_URI or "").lower()
+        return "server" if uri.startswith(("http://", "https://")) else "local-scratch"
+
     # LEGACY. The old demo dataset (demo/data/training_pairs.json) is no longer a
     # training source. This field exists only so a stale value is REJECTED rather than
     # silently ignored (model_config uses extra="ignore", so removing the field would
@@ -200,6 +236,12 @@ class Settings(BaseSettings):
     # ─── Model Inference Service ─────────────────────────────────────
     MODEL_INFERENCE_SERVICE_URL: str = "http://localhost:8090"
 
+    # ─── Triton model repository (model deployment) ──────────────────
+    # Where `python -m src.cli publish-triton` writes customer_matcher_v{N}/.
+    # Must be the directory Triton serves (--model-repository). No default: publishing
+    # must name its target explicitly.
+    TRITON_MODEL_REPOSITORY: Optional[str] = None
+
 
 SYNTHETIC_DATA_ENVIRONMENTS = frozenset({Environment.DEVELOPMENT, Environment.TEST})
 
@@ -218,11 +260,26 @@ def check_training_data_sources(s: "Settings") -> None:
             "to its output directory. Remove DEMO_DATA_DIR from your environment."
         )
     if s.SYNTHETIC_DATA_DIR and s.ENVIRONMENT not in SYNTHETIC_DATA_ENVIRONMENTS:
+        if not s.BOOTSTRAP_MODE:
+            raise ValueError(
+                f"SYNTHETIC_DATA_DIR is set but ENVIRONMENT={s.ENVIRONMENT.value}. "
+                f"Synthetic training data is only permitted in "
+                f"{sorted(e.value for e in SYNTHETIC_DATA_ENVIRONMENTS)}; staging and "
+                f"production use real label sources, or the pinned seed corpus enabled "
+                f"explicitly with BOOTSTRAP_MODE=true and BOOTSTRAP_DATASET_MANIFEST_SHA256."
+            )
+        if not s.bootstrap_manifest_allowlist:
+            raise ValueError(
+                "BOOTSTRAP_MODE=true requires BOOTSTRAP_DATASET_MANIFEST_SHA256: the sha256 "
+                "of the seed corpus's manifest.json. Bootstrap mode never accepts an "
+                "unpinned synthetic directory."
+            )
+    if (s.ENVIRONMENT not in SYNTHETIC_DATA_ENVIRONMENTS
+            and s.mlflow_registry_scope != "server"):
         raise ValueError(
-            f"SYNTHETIC_DATA_DIR is set but ENVIRONMENT={s.ENVIRONMENT.value}. "
-            f"Synthetic training data is only permitted in "
-            f"{sorted(e.value for e in SYNTHETIC_DATA_ENVIRONMENTS)}; staging and "
-            f"production must use real label sources only."
+            f"ENVIRONMENT={s.ENVIRONMENT.value} requires the MLflow server registry "
+            f"(MLFLOW_TRACKING_URI=http(s)://...). A local file/sqlite store "
+            f"({s.MLFLOW_TRACKING_URI!r}) is a scratch registry for development only."
         )
 
 

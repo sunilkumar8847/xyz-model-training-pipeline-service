@@ -252,25 +252,19 @@ class ModelEvaluator:
         output_path: str,
     ) -> str:
         """
-        Export the XGBoost component to ONNX format for Triton deployment.
-        Returns path to ONNX file.
+        Export the XGBoost component to ONNX for Triton. Delegates to the single,
+        verified export path (src.registry.onnx_export), which enforces the
+        50-feature contract and ONNX/XGBoost parity. Returns the written path.
         """
-        import onnxmltools
-        from onnxmltools.convert import convert_xgboost
-        from skl2onnx.common.data_types import FloatTensorType
+        from src.registry.onnx_export import export_xgboost_to_onnx
 
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-
-        # Convert XGBoost to ONNX
-        initial_type = [("float_input", FloatTensorType([None, 50]))]
-        onnx_model = convert_xgboost(
-            models["xgb"]["model"],
-            initial_types=initial_type,
+        rows_idx = dataset.test_indices or list(range(len(dataset.feature_matrix)))
+        export = export_xgboost_to_onnx(
+            models["xgb"]["model"], dataset.feature_names, dataset.feature_matrix[rows_idx],
         )
-
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         with open(output_path, "wb") as f:
-            f.write(onnx_model.SerializeToString())
-
+            f.write(export.onnx_bytes)
         logger.info(f"ONNX model exported to {output_path}")
         return output_path
 

@@ -205,6 +205,13 @@ class FeatureStoreClient:
                 response = await self._post_with_retry(client, body, tenant_id, OFFLINE_ENDPOINT)
                 payload = response.json()
 
+                served_version = payload.get("feature_version")
+                if served_version and served_version != self._feature_version:
+                    raise ValueError(
+                        f"Feature Store answered with feature_version {served_version!r}, "
+                        f"requested {self._feature_version!r}: the feature catalog does not "
+                        f"match this training run."
+                    )
                 names = payload.get("feature_names") or None
                 if names:
                     if self.last_feature_names and names != self.last_feature_names:

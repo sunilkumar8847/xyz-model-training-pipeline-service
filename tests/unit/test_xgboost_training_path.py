@@ -73,6 +73,9 @@ def isolated_mlflow(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "MLFLOW_EXPERIMENT_NAME", "phase3-unit")
     mlflow.set_tracking_uri(uri)
     mlflow.set_registry_uri(uri)
+    # mlflow caches the active experiment id process-wide; select one that exists in
+    # THIS fresh store so ids from an earlier test's store never leak in.
+    mlflow.set_experiment(settings.MLFLOW_EXPERIMENT_NAME)
     yield mlflow
     while mlflow.active_run():
         mlflow.end_run()
@@ -294,7 +297,7 @@ class TestRegistration:
         monkeypatch.setattr(mlflow, "register_model", boom)
 
         with pytest.raises(InfrastructureUnavailableError, match="registry unreachable"):
-            registry.register_model(models=models, evaluation=ev, run=run)
+            registry.register_model(models=models, evaluation=ev, run=run, dataset=ds)
 
     def test_successful_registration_logs_model_and_lineage(self, xgb_only, isolated_mlflow, monkeypatch):
         from mlflow import MlflowClient
@@ -312,7 +315,7 @@ class TestRegistration:
         registry.log_split_stats({"test_pairs": 10})
         models = trainer.train_all(ds, mlflow_run_id=run_id)
         ev = ModelEvaluator(trainer).evaluate(models, ds, model_id="m", run_id=run.run_id)
-        version = registry.register_model(models=models, evaluation=ev, run=run)
+        version = registry.register_model(models=models, evaluation=ev, run=run, dataset=ds)
 
         client = MlflowClient()
         r = client.get_run(run_id)
@@ -325,6 +328,14 @@ class TestRegistration:
         artifacts = {a.path for a in client.list_artifacts(run_id)}
         assert "xgboost_model" in artifacts
         assert "transformer_model" not in artifacts and "gnn_model" not in artifacts
+        # The serving artifact is logged with the version it belongs to.
+        assert {a.path for a in client.list_artifacts(run_id, "onnx_model")} == {
+            "onnx_model/model.onnx", "onnx_model/serving_signature.json"}
+        import mlflow
+        manifest = json.loads(mlflow.artifacts.load_text(f"runs:/{run_id}/ensemble_manifest.json"))
+        assert manifest["registered_model_version"] == version
+        assert manifest["ensemble_version"] == f"v{version}"   # was the run id before
+        assert manifest["onnx_sha256"] and manifest["feature_names_sha256"]
 
 
 # ─── Stage 2: tenant-correct batching (regression) ───────────────────────────

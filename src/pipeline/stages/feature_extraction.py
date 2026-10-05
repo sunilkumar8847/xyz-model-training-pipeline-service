@@ -52,6 +52,9 @@ class FeatureExtractionStage:
         )
         start = time.perf_counter()
         as_of = as_of_timestamp or datetime.utcnow()
+        # Recorded in the model's lineage: without it a run cannot be re-read from the
+        # offline store at the same point in time.
+        run.feature_as_of = as_of
 
         # Batch requests to Feature Store
         feature_rows = await self._fetch_features_batched(pairs, as_of)

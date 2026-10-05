@@ -187,6 +187,7 @@ class TrainingPipeline:
             training_run.features_extracted_at = datetime.utcnow()
 
             self._registry.log_data_stats(training_run)
+            self._registry.log_lineage(training_run)
             self._registry.log_split_stats(self._splitter.last_stats)
 
             # ── Stage 3-5: Model Training ────────────────────────────
@@ -242,6 +243,7 @@ class TrainingPipeline:
                 models=models,
                 evaluation=evaluation,
                 run=training_run,
+                dataset=dataset,
             )
 
             if model_version:
